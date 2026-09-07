@@ -1,0 +1,10 @@
+[server]
+host = "0.0.0.0"
+port = 3000
+
+[database]
+url = "postgresql://localhost:5432/postgres"
+max_connections = 10
+
+[log]
+level = "info"
