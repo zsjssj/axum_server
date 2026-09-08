@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 
 const DEFAULT_PAGE: i64 = 1;
 const DEFAULT_PAGE_SIZE: i64 = 10;
-const MAX_PAGE_SIZE: i64 = 100;
+const MAX_PAGE_SIZE: i64 = 500;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct Pagination {
     #[serde(default = "default_page")]
     page: i64,
@@ -22,7 +24,7 @@ impl Pagination {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PaginatedResponse<T> {
     pub data: Vec<T>,
     pub total: i64,

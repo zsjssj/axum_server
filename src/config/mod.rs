@@ -32,9 +32,9 @@ impl AppConfig {
         dotenv::dotenv().ok();
 
         // 获取运行环境，默认为 development
-        let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
+        let run_mode: String = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
 
-        let config = Config::builder()
+        let config: Config = Config::builder()
             // 加载默认配置
             .add_source(File::with_name("config/default"))
             // 根据环境加载配置文件（如 config/development.toml 或 config/production.toml）

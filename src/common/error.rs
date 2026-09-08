@@ -3,14 +3,20 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde_json::json;
+use serde::Serialize;
+use utoipa::ToSchema;
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
+}
 
 #[derive(Debug)]
 pub enum AppError {
-    NotFound(&'static str),
-    Conflict(&'static str),
-    Database(sqlx::Error),
-    Internal(&'static str),
+    NotFound(&'static str), // 资源未找到
+    Conflict(&'static str), // 请求冲突
+    Database(sqlx::Error),  // 数据库错误
+    Internal(&'static str), // 内部错误
 }
 
 impl From<sqlx::Error> for AppError {
@@ -34,6 +40,12 @@ impl IntoResponse for AppError {
             }
         };
 
-        (status, Json(json!({ "error": message }))).into_response()
+        (
+            status,
+            Json(ErrorResponse {
+                error: message.to_owned(),
+            }),
+        )
+            .into_response()
     }
 }

@@ -7,6 +7,7 @@ use crate::common::error::AppError;
 use crate::modules::user::model::{CreateUserRequest, UpdateUserRequest, User};
 use crate::modules::user::repository::UserRepository;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// 用户业务逻辑层
 pub struct UserService;
@@ -14,14 +15,24 @@ pub struct UserService;
 impl UserService {
     /// 创建用户
     pub async fn create_user(db: &PgPool, req: CreateUserRequest) -> Result<User, AppError> {
-        let password_hash = hash_password(&req.password)?;
+        let CreateUserRequest {
+            username,
+            email,
+            password,
+            nickname,
+        } = req;
+        let public_id = generate_public_id();
+        let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+            .await
+            .map_err(|_| AppError::Internal("密码哈希任务失败"))??;
 
         match UserRepository::create(
             db,
-            &req.username,
-            &req.email,
+            public_id,
+            &username,
+            &email,
             &password_hash,
-            req.nickname.as_deref(),
+            nickname.as_deref(),
         )
         .await
         {
@@ -45,9 +56,9 @@ impl UserService {
         Ok((users, total))
     }
 
-    /// 根据 ID 获取用户
-    pub async fn get_user_by_id(db: &PgPool, id: i32) -> Result<User, AppError> {
-        UserRepository::find_by_id(db, id)
+    /// 根据公开 ID 获取用户
+    pub async fn get_user_by_public_id(db: &PgPool, public_id: Uuid) -> Result<User, AppError> {
+        UserRepository::find_by_public_id(db, public_id)
             .await?
             .ok_or(AppError::NotFound("用户不存在"))
     }
@@ -55,17 +66,17 @@ impl UserService {
     /// 更新用户
     pub async fn update_user(
         db: &PgPool,
-        id: i32,
+        public_id: Uuid,
         req: UpdateUserRequest,
     ) -> Result<User, AppError> {
-        UserRepository::update(db, id, req.email.as_deref(), req.nickname.as_deref())
+        UserRepository::update(db, public_id, req.email.as_deref(), req.nickname.as_deref())
             .await?
             .ok_or(AppError::NotFound("用户不存在"))
     }
 
     /// 删除用户
-    pub async fn delete_user(db: &PgPool, id: i32) -> Result<(), AppError> {
-        let deleted = UserRepository::delete(db, id).await?;
+    pub async fn delete_user(db: &PgPool, public_id: Uuid) -> Result<(), AppError> {
+        let deleted = UserRepository::delete(db, public_id).await?;
 
         if !deleted {
             return Err(AppError::NotFound("用户不存在"));
@@ -81,6 +92,10 @@ fn hash_password(password: &str) -> Result<String, AppError> {
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|_| AppError::Internal("密码哈希失败"))
+}
+
+fn generate_public_id() -> Uuid {
+    Uuid::now_v7()
 }
 
 #[cfg(test)]
@@ -99,5 +114,12 @@ mod tests {
                 .is_ok()
         );
         assert_ne!(encoded, "secret");
+    }
+
+    #[test]
+    fn generates_uuid_v7_public_id() {
+        let public_id = generate_public_id();
+
+        assert_eq!(public_id.get_version_num(), 7);
     }
 }

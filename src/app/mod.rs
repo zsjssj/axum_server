@@ -1,4 +1,5 @@
 pub mod middleware;
+pub mod openapi;
 pub mod routes;
 pub mod state;
 
@@ -14,6 +15,7 @@ pub fn create_app(db_pool: PgPool) -> Router {
     Router::new()
         .merge(routes::health_routes())
         .merge(routes::api_routes())
+        .merge(openapi::routes())
         .layer(cors_layer())
         .layer(axum::middleware::from_fn(logging_middleware))
         .with_state(state)
