@@ -4,9 +4,10 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::app::routes::{HealthResponse, HelloResponse, ReadinessResponse, ServerInfoResponse};
 use crate::app::state::AppState;
-use crate::common::error::ErrorResponse;
+use crate::common::error::{ErrorData, ErrorDetail};
 use crate::common::pagination::PaginatedResponse;
-use crate::modules::user::model::{CreateUserRequest, DeleteUserResponse, UpdateUserRequest, User};
+use crate::common::response::{ApiResponse, EmptyData};
+use crate::modules::user::model::{CreateUserRequest, UpdateUserRequest, User};
 
 /// 服务 OpenAPI 文档定义
 #[derive(OpenApi)]
@@ -35,9 +36,17 @@ use crate::modules::user::model::{CreateUserRequest, DeleteUserResponse, UpdateU
         User,
         CreateUserRequest,
         UpdateUserRequest,
-        DeleteUserResponse,
         PaginatedResponse<User>,
-        ErrorResponse,
+        ApiResponse<User>,
+        ApiResponse<PaginatedResponse<User>>,
+        ApiResponse<ServerInfoResponse>,
+        ApiResponse<HealthResponse>,
+        ApiResponse<ReadinessResponse>,
+        ApiResponse<HelloResponse>,
+        ApiResponse<ErrorData>,
+        ApiResponse<EmptyData>,
+        ErrorDetail,
+        ErrorData,
     )),
     tags(
         (name = "系统", description = "服务状态与示例接口"),

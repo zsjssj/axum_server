@@ -19,3 +19,8 @@ argon2 = "0.5"
 utoipa = { version = "5.5.0", features = ["uuid"] }
 utoipa-swagger-ui = { version = "8", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["serde", "v7"] }
+validator = { version = "0.20", features = ["derive"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

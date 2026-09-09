@@ -10,6 +10,7 @@
 - Tokio：异步运行时及阻塞任务调度。
 - SQLx：PostgreSQL 连接池与数据访问。
 - Serde：请求、响应和配置的序列化与反序列化。
+- Validator：请求模型和查询参数的声明式校验。
 - config + dotenv：分环境配置加载。
 - tracing：结构化日志。
 - Argon2：密码哈希。
@@ -113,14 +114,14 @@ APP__DATABASE__URL=postgresql://user:password@host/database
 
 1. 请求先经过 CORS 与日志中间件。
 2. Router 将请求匹配到用户模块的 `create_user` Handler。
-3. Handler 从 `AppState` 提取数据库连接池，并将 JSON 请求体反序列化为 `CreateUserRequest`。
+3. 自定义提取器将 JSON 请求体反序列化为 `CreateUserRequest`，执行模型校验，并把解析或校验错误转换成统一 JSON 响应；校验通过后 Handler 再从 `AppState` 提取数据库连接池。
 4. `UserService` 执行业务流程，通过 `spawn_blocking` 在线程池中计算 Argon2 密码哈希，避免 CPU 密集型计算阻塞异步执行器。
 5. `UserRepository` 使用参数绑定执行插入 SQL，防止 SQL 注入，并返回不包含密码哈希的用户实体。
 6. Service 将唯一键冲突转换为统一的 `AppError::Conflict`。
-7. Handler 将成功结果转换为 `201 Created`；失败结果由 `AppError::into_response` 转换为统一 JSON 错误响应。
+7. Handler 将成功数据包装为 `ApiResponse<T>` 并转换为 `201 Created`；失败结果由 `AppError::into_response` 转换为相同响应信封。
 8. 日志中间件记录请求方法、路径、状态码和耗时。
 
-查询、更新和删除请求遵循同样的调用方向。分页参数在 `common::pagination` 中统一归一化：页码最小为 1，每页数量限制在 1 到 100 之间。
+查询、更新和删除请求遵循同样的调用方向。JSON、Query 和 Path 参数均通过 `common::extractor` 中的提取器进入统一错误边界。分页参数要求页码大于等于 1、每页数量处于 1 到 100 之间，超出范围时返回校验错误，不再静默纠正客户端输入。
 
 ## 6. 全局状态与中间件
 
@@ -137,10 +138,19 @@ APP__DATABASE__URL=postgresql://user:password@host/database
 
 `AppError` 是应用统一错误边界，负责将内部错误转换为 HTTP 状态码和 JSON 响应：
 
+- `BadRequest` → `400 Bad Request`
+- `Validation` / `UnprocessableEntity` → `422 Unprocessable Entity`
+- `UnsupportedMediaType` → `415 Unsupported Media Type`
 - `NotFound` → `404 Not Found`
+- `MethodNotAllowed` → `405 Method Not Allowed`
 - `Conflict` → `409 Conflict`
+- `ServiceUnavailable` → `503 Service Unavailable`
 - `Database` → `500 Internal Server Error`
 - `Internal` → `500 Internal Server Error`
+
+所有成功和失败响应均使用 `ApiResponse<T> { code, message, data }` 信封。数字 `code` 与 HTTP 状态码职责分离：HTTP 状态码供网关、监控和通用客户端判断协议结果，业务码供前端稳定处理，其中成功固定为 `0`。成功时 `data` 保存业务模型；失败时通常为 `null`，参数校验失败时保存 `{ details: [{ field, message }] }`，以保留具体字段原因。自定义 JSON、Query、Path 提取器以及 Router 的 404、405 fallback 可防止 Axum 默认纯文本拒绝响应绕过该结构。
+
+业务码按错误类别分段：请求格式 `40000`、参数校验 `40001`、媒体类型 `40002`、资源不存在 `40400`、方法不允许 `40500`、业务冲突 `40900`、内部错误 `50000`、服务不可用 `50300`。新增业务模块时应在对应号段中定义更具体的业务码，避免直接复用无语义的字符串。
 
 数据库错误的详细内容只写入服务端日志，对客户端统一返回“服务器内部错误”，避免泄露数据库结构、SQL 或连接信息。业务模块应尽量把可预期的底层错误转换为明确的业务错误，其他数据库错误通过 `From<sqlx::Error>` 进入统一处理。
 
