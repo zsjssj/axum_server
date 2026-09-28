@@ -98,7 +98,6 @@ pub(crate) async fn get_user(
     ApiPath(public_id): ApiPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let user = UserService::get_user_by_public_id(&state.db, public_id).await?;
-
     Ok(Json(ApiResponse::success("查询成功", user)))
 }
 

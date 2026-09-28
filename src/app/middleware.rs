@@ -9,7 +9,6 @@ pub async fn logging_middleware(request: Request, next: Next) -> Response {
     let start = Instant::now();
 
     let response = next.run(request).await;
-
     let duration = start.elapsed();
     let status = response.status();
 
@@ -20,7 +19,6 @@ pub async fn logging_middleware(request: Request, next: Next) -> Response {
         duration_ms = duration.as_secs_f64() * 1000.0,
         "request completed"
     );
-
     response
 }
 

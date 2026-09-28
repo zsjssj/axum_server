@@ -29,7 +29,7 @@ pub struct LogConfig {
 impl AppConfig {
     pub fn new() -> Result<Self, ConfigError> {
         // 加载 .env 文件（如果存在）
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
 
         // 获取运行环境，默认为 development
         let run_mode: String = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());

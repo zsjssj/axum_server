@@ -46,7 +46,7 @@ impl ApiResponse<()> {
 #[derive(Debug, Clone, Copy)]
 #[repr(i32)]
 pub enum ApiCode {
-    Success = 0, //接口成功
+    Success = 200, //接口成功
     BadRequest = 40000,
     ValidationError = 40001,
     UnsupportedMediaType = 40002,
