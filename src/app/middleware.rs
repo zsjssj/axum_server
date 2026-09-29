@@ -1,16 +1,22 @@
-use axum::{extract::Request, middleware::Next, response::Response};
-use std::time::Instant;
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{Method, Response as ResponseH, Uri, status},
+    middleware::Next,
+    response::Response,
+};
+use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
 
 /// 日志中间件
 pub async fn logging_middleware(request: Request, next: Next) -> Response {
-    let method = request.method().clone();
-    let uri = request.uri().clone();
-    let start = Instant::now();
+    let method: Method = request.method().clone(); //获取请求方式
+    let uri: Uri = request.uri().clone(); //获取请求地址
+    let start: Instant = Instant::now(); //获取请求时间
 
-    let response = next.run(request).await;
-    let duration = start.elapsed();
-    let status = response.status();
+    let response: ResponseH<Body> = next.run(request).await; //获取响应体
+    let duration: Duration = start.elapsed(); //获取响应时间
+    let status: status::StatusCode = response.status(); //获取响应状态
 
     tracing::info!(
         %method,

@@ -13,32 +13,6 @@ use axum::{
 use serde::Serialize;
 use utoipa::ToSchema;
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ServerInfoResponse {
-    name: &'static str,
-    version: &'static str,
-    status: &'static str,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct HealthResponse {
-    status: &'static str,
-    timestamp: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct HelloResponse {
-    message: &'static str,
-    timestamp: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ReadinessResponse {
-    status: &'static str,
-    database: &'static str,
-    timestamp: String,
-}
-
 /// 健康检查路由
 pub fn health_routes() -> Router<AppState> {
     Router::new()
@@ -57,6 +31,12 @@ pub fn api_routes() -> Router<AppState> {
     )
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ServerInfoResponse {
+    name: &'static str,
+    version: &'static str,
+    status: &'static str,
+}
 /// 根路径处理器
 #[utoipa::path(
     get,
@@ -75,6 +55,11 @@ pub(crate) async fn root_handler() -> impl IntoResponse {
     ))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthResponse {
+    status: &'static str,
+    timestamp: String,
+}
 /// 健康检查处理器
 #[utoipa::path(
     get,
@@ -92,6 +77,12 @@ pub(crate) async fn health_handler() -> impl IntoResponse {
     ))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReadinessResponse {
+    status: &'static str,
+    database: &'static str,
+    timestamp: String,
+}
 /// 就绪检查处理器（包含数据库检查）
 #[utoipa::path(
     get,
@@ -121,6 +112,11 @@ pub(crate) async fn readiness_handler(
     }
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HelloResponse {
+    message: &'static str,
+    timestamp: String,
+}
 /// 示例 API 处理器
 #[utoipa::path(
     get,
