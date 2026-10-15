@@ -1,9 +1,5 @@
-use argon2::{
-    Argon2, PasswordHasher,
-    password_hash::{SaltString, rand_core::OsRng},
-};
-
 use crate::common::error::AppError;
+use crate::common::password::hash_password;
 use crate::modules::user::model::{CreateUserRequest, UpdateUserRequest, User};
 use crate::modules::user::repository::UserRepository;
 use sqlx::PgPool;
@@ -86,14 +82,6 @@ impl UserService {
     }
 }
 
-fn hash_password(password: &str) -> Result<String, AppError> {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|_| AppError::Internal("密码哈希失败"))
-}
-
 fn generate_public_id() -> Uuid {
     Uuid::now_v7()
 }
@@ -101,20 +89,6 @@ fn generate_public_id() -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::{PasswordHash, PasswordVerifier};
-
-    #[test]
-    fn hashes_password_with_argon2() {
-        let encoded = hash_password("secret").expect("password should be hashed");
-        let parsed = PasswordHash::new(&encoded).expect("hash should be valid");
-
-        assert!(
-            Argon2::default()
-                .verify_password(b"secret", &parsed)
-                .is_ok()
-        );
-        assert_ne!(encoded, "secret");
-    }
 
     #[test]
     fn generates_uuid_v7_public_id() {

@@ -1,0 +1,11 @@
+# 全局默认：保持键的原有顺序，不排序
+[formatting]
+reorder_keys = false
+
+# 规则：仅对 Cargo.toml 的依赖表启用排序
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = ["dependencies", "dev-dependencies", "build-dependencies"]
+
+[rule.formatting]
+reorder_keys = true

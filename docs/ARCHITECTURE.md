@@ -14,6 +14,7 @@
 - config + dotenv：分环境配置加载。
 - tracing：结构化日志。
 - Argon2：密码哈希。
+- jsonwebtoken：签发与校验 access token（HS256）。
 - Utoipa + Swagger UI：从代码注解生成 OpenAPI 文档并提供交互式浏览入口。
 
 ## 2. 目录与职责
@@ -29,6 +30,7 @@ rust-axum-server/
     ├── config/             # 配置结构定义与加载逻辑
     ├── infrastructure/     # 数据库等外部基础设施适配
     ├── modules/            # 业务模块
+    │   ├── auth/           # 认证模块：登录、令牌刷新、登出
     │   └── user/           # 用户模块
     └── main.rs             # 程序入口与启动流程
 ```
@@ -70,24 +72,26 @@ PostgreSQL
 
 1. `main` 进入 Tokio 异步运行时并调用 `run`。
 2. `AppConfig::new` 加载环境变量和配置文件。
-3. 根据日志级别初始化 `tracing` 订阅器。
-4. 根据数据库配置创建 PostgreSQL 连接池。
-5. SQLx 执行编译进程序的 `migrations` 迁移；迁移失败时终止启动，避免服务在数据库结构不完整时接收流量。
-6. `create_app` 创建 `AppState`，组装健康检查路由、API 路由和中间件。
-7. 根据主机与端口配置绑定 TCP 监听器。
-8. Axum 接管监听器并开始处理请求。
-8. 任一启动步骤失败时，错误返回到 `main`，程序输出错误并以非零状态退出。
+3. `AppConfig::validate` 校验配置。弱 JWT 密钥、非正数有效期、重复的 Cookie 名称等问题在此被拒绝，避免服务带着可被伪造的令牌签发能力对外提供服务。
+4. 根据日志级别初始化 `tracing` 订阅器。
+5. 根据数据库配置创建 PostgreSQL 连接池。
+6. SQLx 执行编译进程序的 `migrations` 迁移；迁移失败时终止启动，避免服务在数据库结构不完整时接收流量。
+7. `create_app` 创建 `AppState`（连接池与认证配置），组装健康检查路由、API 路由和中间件。
+8. 根据主机与端口配置绑定 TCP 监听器。
+9. Axum 通过 `into_make_service_with_connect_info` 接管监听器并开始处理请求。使用带连接信息的服务是因为登录与刷新接口需要记录客户端 IP 用于安全审计。
+10. 任一启动步骤失败时，错误返回到 `main`，程序输出错误并以非零状态退出。
 
 ```text
 main
   └─ run
       ├─ 加载配置
+      ├─ 校验配置
       ├─ 初始化日志
       ├─ 创建数据库连接池
       ├─ 执行数据库迁移
       ├─ 组装 Axum Router 与 AppState
       ├─ 绑定 TCP 地址
-      └─ 启动 HTTP 服务
+      └─ 启动 HTTP 服务（携带连接信息）
 ```
 
 ## 4. 配置加载流程
@@ -108,6 +112,26 @@ APP__DATABASE__URL=postgresql://user:password@host/database
 
 设计思路是将配置结构集中定义在 `src/config`，业务代码只依赖已经完成反序列化的强类型配置，避免在各模块中分散读取环境变量。
 
+### 数据库需要 UTF-8 兼容的错误消息
+
+PostgreSQL 必须配置为返回 UTF-8 兼容的错误文本，否则 SQLx 无法解析任何服务端错误：
+
+```conf
+# postgresql.conf
+lc_messages = 'C'
+```
+
+原因不是编码偏好问题。当 `lc_messages` 设为中文（如 `zh-CN`）时，Windows 版 PostgreSQL 会用系统 ANSI 代码页（GBK）编码错误消息，而 SQLx 要求 UTF-8。结果是**任何**数据库错误——包括连接认证失败和迁移失败——都会被替换为一条含义模糊的协议错误：
+
+```text
+Postgres protocol error (reading ErrorResponse): Postgres returned a
+non-UTF-8 string for its error message.
+```
+
+该提示把真正的原因（例如「密码认证失败」）完全掩盖，显著增加排查成本。设为 `C` 后消息为纯 ASCII，任何客户端都能正确解码。
+
+注意客户端侧的 `PGCLIENTENCODING` **不能**覆盖该行为，因为它只影响客户端编码协商，不改变服务端错误消息的语言与编码。
+
 ## 5. HTTP 请求处理流程
 
 以 `POST /api/v1/users` 为例：
@@ -123,50 +147,104 @@ APP__DATABASE__URL=postgresql://user:password@host/database
 
 查询、更新和删除请求遵循同样的调用方向。JSON、Query 和 Path 参数均通过 `common::extractor` 中的提取器进入统一错误边界。分页参数要求页码大于等于 1、每页数量处于 1 到 100 之间，超出范围时返回校验错误，不再静默纠正客户端输入。
 
-## 6. 全局状态与中间件
+### 受保护接口的认证流程
 
-`AppState` 保存可以安全共享的应用级依赖，当前仅包含 `PgPool`。Axum 会克隆 State，但 `PgPool` 内部使用共享句柄，因此不会为每次请求创建新的连接池。
+以 `GET /api/v1/auth/me` 为例：
+
+1. 请求先经过 CORS 与日志中间件。
+2. Handler 提取 `CurrentUser`。该提取器从 `access_token` Cookie 读取 JWT，校验签名、签发者、有效期与 `typ` 声明，并把任何失败转换为统一的 `AppError::Unauthorized`。
+3. 认证通过后 Handler 再提取 `State` 与业务参数，后续流程与匿名接口一致。
+
+`CurrentUser` 是提取器而不是全局中间件：Handler 签名中出现该类型即表示接口需要登录，认证要求直接体现在类型上，不需要回看路由配置或中间件注册顺序。令牌**只从 Cookie 读取**，不接受 `Authorization` 头，避免出现绕过 Cookie 安全属性的旁路认证方式。
+
+## 6. 认证与令牌设计
+
+认证模块位于 `src/modules/auth`，遵循与其他业务模块相同的分层结构。
+
+### 双令牌与 Cookie 下发
+
+登录成功后签发两个令牌，均通过 `Set-Cookie` 响应头下发，**响应体不包含令牌**：
+
+| 令牌 | 格式 | 有效期 | 服务端状态 |
+| --- | --- | --- | --- |
+| access token | JWT（HS256） | 15 分钟 | 无状态，不落库 |
+| refresh token | 256 位随机值 | 7 天 | 只存 SHA-256 摘要 |
+
+Cookie 固定启用 `HttpOnly`，`Secure` 与 `SameSite` 由 `auth.cookie` 配置控制。`HttpOnly` 使页面脚本无法读取令牌，把 XSS 的影响限制为"代为发请求"，而无法长期窃取凭据。两个 Cookie 的 `Max-Age` 分别匹配各自令牌的有效期。
+
+`AuthService::TokenPair` 刻意不派生 `Serialize`：令牌在类型上不可序列化，从代码层面杜绝被误放进 JSON 响应。
+
+### 令牌轮换与重放检测
+
+`/auth/refresh` 采用轮换策略：每次刷新签发新的 refresh token，并把旧会话标记为已吊销、在 `replaced_by` 中记录轮换关系。
+
+已吊销的 refresh token 再次被使用会被判定为泄露重放，服务端随即吊销该用户的全部会话。此时无法分辨攻击者与合法用户，只能让双方都重新登录——这是"宁可多一次登录，也不允许泄露令牌继续可用"的取舍。
+
+### 登出语义的边界
+
+access token 无状态，服务端无法逐个吊销。因此**登出只能立即失效 refresh token**，已签发的 access token 最多再存活 15 分钟。这是双令牌方案的固有性质，不是实现缺陷，对安全性要求更高的场景应缩短 `access_ttl_minutes`。
+
+### 登录保护
+
+登录失败按用户名与滑动时间窗口统计，超过阈值后返回 `429`。两个关键顺序约束：
+
+- 失败记录独立存放于 `login_failures` 表，不在 `users` 表上做账号锁定，避免自动锁定被用作针对特定账号的拒绝服务手段。
+- **先判定限流，再校验密码**。Argon2 校验被刻意设计得很慢，顺序颠倒会让大量失败请求持续占用阻塞线程池，使限流本身成为消耗算力的攻击面。
+
+此外，用户名不存在时同样执行一次 Argon2 计算，使用户名枚举无法通过响应耗时区分账号是否存在。
+
+### CSRF 防护
+
+Cookie 会自动随请求发送，因此必须防 CSRF。主要防线是 `SameSite=Strict`（默认值）；配置为未知取值时会回退到 `Strict`，不存在"写错配置导致防护静默放宽"的路径。辅助措施是写操作全部使用 `POST` 且强制 `application/json` 请求体，使跨源请求必须先通过预检。**生产环境仍应配合 CORS 白名单收紧来源。**
+
+## 7. 全局状态与中间件
+
+`AppState` 保存可以安全共享的应用级依赖：`PgPool`、`Arc<JwtConfig>` 与 `Arc<AuthConfig>`。Axum 会克隆 State，但 `PgPool` 内部使用共享句柄、配置项使用 `Arc`，因此不会为每次请求复制连接池或配置内容。认证配置随状态共享，使提取器可以在校验令牌时直接访问 JWT 密钥，而不必让每个受保护的 Handler 多一个依赖参数。
 
 当前中间件包括：
 
 - 日志中间件：记录方法、URI、响应状态和处理耗时。
-- CORS 中间件：当前允许任意来源、方法和请求头，便于开发联调；生产环境应根据实际前端域名收紧规则。
+- CORS 中间件：当前允许任意来源、方法和请求头，便于开发联调；生产环境应根据实际前端域名收紧规则。若前端与后端跨源部署，**必须启用凭据支持并指定具体来源**，因为浏览器不会在通配来源下携带 Cookie。
 
 新增全局依赖时，应优先加入 `AppState`，由 Handler 通过 `State` 提取，避免使用全局可变变量。
 
-## 7. 错误处理设计
+## 8. 错误处理设计
 
 `AppError` 是应用统一错误边界，负责将内部错误转换为 HTTP 状态码和 JSON 响应：
 
 - `BadRequest` → `400 Bad Request`
 - `Validation` / `UnprocessableEntity` → `422 Unprocessable Entity`
 - `UnsupportedMediaType` → `415 Unsupported Media Type`
+- `Unauthorized` → `401 Unauthorized`
 - `NotFound` → `404 Not Found`
 - `MethodNotAllowed` → `405 Method Not Allowed`
 - `Conflict` → `409 Conflict`
+- `TooManyRequests` → `429 Too Many Requests`
 - `ServiceUnavailable` → `503 Service Unavailable`
 - `Database` → `500 Internal Server Error`
 - `Internal` → `500 Internal Server Error`
 
-所有成功和失败响应均使用 `ApiResponse<T> { code, message, data }` 信封。数字 `code` 与 HTTP 状态码职责分离：HTTP 状态码供网关、监控和通用客户端判断协议结果，业务码供前端稳定处理，其中成功固定为 `0`。成功时 `data` 保存业务模型；失败时通常为 `null`，参数校验失败时保存 `{ details: [{ field, message }] }`，以保留具体字段原因。自定义 JSON、Query、Path 提取器以及 Router 的 404、405 fallback 可防止 Axum 默认纯文本拒绝响应绕过该结构。
+所有成功和失败响应均使用 `ApiResponse<T> { code, message, data }` 信封。数字 `code` 与 HTTP 状态码职责分离：HTTP 状态码供网关、监控和通用客户端判断协议结果，业务码供前端稳定处理，其中成功固定为 `0`。由于 `ApiCode` 使用 `#[repr(i32)]`，`Success` 必须显式声明为 `0` 而不是复用 HTTP 的 `200`，否则会出现"HTTP 成功但业务码表示失败"的矛盾。成功时 `data` 保存业务模型；失败时通常为 `null`，参数校验失败时保存 `{ details: [{ field, message }] }`，以保留具体字段原因。自定义 JSON、Query、Path 提取器以及 Router 的 404、405 fallback 可防止 Axum 默认纯文本拒绝响应绕过该结构。
 
-业务码按错误类别分段：请求格式 `40000`、参数校验 `40001`、媒体类型 `40002`、资源不存在 `40400`、方法不允许 `40500`、业务冲突 `40900`、内部错误 `50000`、服务不可用 `50300`。新增业务模块时应在对应号段中定义更具体的业务码，避免直接复用无语义的字符串。
+业务码按错误类别分段：请求格式 `40000`、参数校验 `40001`、媒体类型 `40002`、未认证 `40100`、资源不存在 `40400`、方法不允许 `40500`、业务冲突 `40900`、触发限流 `42900`、内部错误 `50000`、服务不可用 `50300`。新增业务模块时应在对应号段中定义更具体的业务码，避免直接复用无语义的字符串。
 
 数据库错误的详细内容只写入服务端日志，对客户端统一返回“服务器内部错误”，避免泄露数据库结构、SQL 或连接信息。业务模块应尽量把可预期的底层错误转换为明确的业务错误，其他数据库错误通过 `From<sqlx::Error>` 进入统一处理。
 
-## 8. 数据与安全设计
+## 9. 数据与安全设计
 
-- 密码仅以 Argon2 哈希形式写入数据库，API 响应和查询字段均不包含 `password_hash`。
-- 用户采用内部 `BIGINT IDENTITY` 主键与公开 UUIDv7 双 ID。内部主键用于数据库关联和排序，不通过 API 暴露；UUIDv7 由 Service 在创建用户时生成，作为接口路径、响应和跨系统传递使用的稳定标识。
-- 所有 SQL 使用 SQLx 参数绑定，不拼接用户输入。
+- 密码仅以 Argon2 哈希形式写入数据库，API 响应和查询字段均不包含 `password_hash`。认证查询通过独立的 `UserCredentials` 类型返回凭证，该类型不派生 `Serialize` 与 `ToSchema`；把 `password_hash` 挂到公开的 `User` 上会使其顺着响应序列化和 OpenAPI Schema 一起对外暴露，类型分离是这里唯一可靠的防线。
+- 令牌通过 `HttpOnly` Cookie 下发，响应体不携带令牌；access token 与 refresh token 使用不同有效期，Cookie 的 `Max-Age` 分别匹配。
+- refresh token 只保存 SHA-256 摘要，数据库泄露时无法反推出可用令牌；因其本身是 256 位随机值，不存在字典攻击空间，无需使用慢速哈希。
+- 用户采用内部 `BIGINT IDENTITY` 主键与公开 UUIDv7 双 ID。内部主键用于数据库关联和排序，不通过 API 暴露；UUIDv7 由 Service 在创建用户时生成，作为接口路径、响应和跨系统传递使用的稳定标识。认证令牌的 `sub` 使用内部主键，使受保护接口可直接命中主键索引。
+- 所有 SQL 使用 SQLx 参数绑定，不拼接用户输入。IP 地址以文本绑定并由 `$n::inet` 交给 PostgreSQL 校验格式。
 - 数据库连接通过连接池复用，并设置连接获取超时。
 - 健康检查 `/health` 只表示进程可响应；就绪检查 `/ready` 会执行数据库探测，用于判断服务是否具备接收业务流量的条件。
 - 数据库结构通过 `migrations` 目录中的脚本维护；迁移脚本会在编译时嵌入程序，并在服务启动、开始监听端口前自动执行。
-- 已发布或可能已执行的结构变更应新增迁移文件，不直接修改历史迁移；任何迁移失败都会中止服务启动。当前用户表尚未投入使用，因此初始迁移可以随首次建表方案调整。
+- 已发布或可能已执行的结构变更应新增迁移文件，不直接修改历史迁移；任何迁移失败都会中止服务启动。认证相关表通过 `002_create_auth_tables.sql` 新增，未改动 `001`。
 
-## 9. 模块扩展方式
+## 10. 模块扩展方式
 
-新增业务模块时，建议沿用用户模块的组织方式：
+新增业务模块时，建议沿用用户模块与认证模块的组织方式：
 
 ```text
 src/modules/{module}/
@@ -179,18 +257,21 @@ src/modules/{module}/
 
 推荐步骤：
 
-1. 在 `model.rs` 定义实体、请求和响应数据结构。
+1. 在 `model.rs` 定义实体、请求和响应数据结构。只有需要序列化给调用方的模型才派生 `Serialize` 与 `ToSchema`；密码哈希这类内部字段应放在单独的类型中，避免顺着响应序列化泄露出去。
 2. 在 `repository.rs` 实现最小粒度的数据访问操作。
 3. 在 `service.rs` 组合业务规则并处理业务错误。
 4. 在 `handler.rs` 定义路由和 HTTP 适配逻辑。
 5. 在模块的 `mod.rs` 暴露路由入口。
 6. 在 `src/modules/mod.rs` 注册模块。
 7. 在 `src/app/routes.rs` 合并模块路由。
-8. 补充迁移、测试和对应 API 文档。
+8. 在 `src/app/openapi.rs` 注册新增的接口与 Schema。
+9. 补充迁移、测试和对应 API 文档。
+
+跨模块复用的能力应下沉到 `common`，而不是让一个业务模块引用另一个业务模块的内部实现。例如密码哈希原本定义在用户模块中，认证模块也需要相同的 Argon2 参数，于是抽取为 `common::password`；两处独立实现很容易在参数上逐渐分叉，导致同一密码在不同入口得到强度不一致的哈希。
 
 如果业务逐渐复杂，可以在模块内部继续拆分领域对象或子模块，但仍需保持 HTTP、业务和持久化职责之间的边界。
 
-## 10. 设计原则
+## 11. 设计原则
 
 - 按业务模块聚合：同一业务的 Handler、Service、Repository 和 Model 放在同一模块中，减少跨目录跳转。
 - 分层但不过度抽象：当前直接使用具体类型和静态方法；只有在出现真实的替换、复用或测试隔离需求时，再引入 Trait 等抽象。
@@ -199,7 +280,7 @@ src/modules/{module}/
 - 默认保护敏感信息：内部错误记录到日志，对外只返回稳定且必要的信息。
 - 文档随实现更新：路由、模块边界、配置优先级或关键设计发生变化时，应同步更新本文件和对应 API 文档。
 
-## 11. 注释语言约束
+## 12. 注释语言约束
 
 本项目的代码注释和文档注释统一使用中文，包括 `//`、`/* ... */`、`///` 和 `//!` 注释。
 
@@ -211,7 +292,7 @@ src/modules/{module}/
 
 新增或修改代码时，应优先说明设计意图、边界条件和非显而易见的原因，避免使用只重复代码行为的无效注释。该约束的仓库级执行规则见根目录 `AGENTS.md`。
 
-## 12. API 文档生成
+## 13. API 文档生成
 
 接口文档以代码定义为唯一来源：
 
@@ -220,4 +301,6 @@ src/modules/{module}/
 - 查询参数模型通过 `IntoParams` 生成参数定义。
 - `src/app/openapi.rs` 汇总所有接口和模型，并挂载 Swagger UI。
 
-服务启动后可通过 `/swagger-ui/` 浏览交互式文档，通过 `/api-docs/openapi.json` 获取 OpenAPI JSON。新增或调整接口时，必须同步调整代码注解；手写 Markdown 只保留使用说明，不再重复维护完整的接口结构。
+认证采用 Cookie 方案，因此**不注册 `bearer_auth` 安全方案**：残留的 Bearer 方案会让调用方误以为存在 `Authorization` 头这条认证路径。
+
+服务启动后可通过 `/swagger-ui/` 浏览交互式文档，通过 `/api-docs/openapi.json` 获取 OpenAPI JSON。新增或调整接口时，必须同步调整代码注解；手写 Markdown 只保留使用说明，不再重复维护完整的接口结构。各模块文档见 `docs/USER_API.md` 与 `docs/AUTH_API.md`。

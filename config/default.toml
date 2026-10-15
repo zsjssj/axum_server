@@ -8,3 +8,29 @@ max_connections = 10
 
 [log]
 level = "info"
+
+# JWT 配置。
+# secret 仅是本地开发用的占位值，生产环境必须通过 APP__JWT__SECRET 注入高强度随机密钥；
+# 启动时会校验长度，不足 32 个字符的密钥将导致启动失败。
+[jwt]
+secret = "dev-only-insecure-secret-change-me-32chars"
+issuer = "rust-axum-server"
+access_ttl_minutes = 15
+refresh_ttl_days = 7
+
+# 登录保护配置：滑动窗口内失败次数达到上限后暂时拒绝登录尝试。
+[auth]
+max_login_failures = 5
+login_window_minutes = 15
+
+# 令牌 Cookie 配置。
+# secure = false 仅适用于本地 HTTP 调试；生产环境必须改为 true，
+# 否则令牌会在明文 HTTP 中传输并可能被中间人截获。
+# same_site 默认 strict，禁止浏览器在跨站请求中携带令牌 Cookie。
+[auth.cookie]
+access_name = "access_token"
+refresh_name = "refresh_token"
+secure = false
+same_site = "strict"
+path = "/"
+

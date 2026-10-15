@@ -19,6 +19,19 @@ pub struct User {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+/// 认证专用的用户凭证视图。
+///
+/// 刻意与公开的 [`User`] 分离，且不派生 `Serialize` 与 `ToSchema`：
+/// 一旦把 `password_hash` 挂到 `User` 上，它会顺着响应序列化和 OpenAPI
+/// Schema 一起对外暴露。类型分离是这里唯一可靠的防线。
+#[derive(Debug, sqlx::FromRow)]
+pub struct UserCredentials {
+    /// 内部自增主键，仅用于数据库关联与令牌 `sub`，不通过 API 暴露。
+    pub id: i64,
+    pub public_id: Uuid,
+    pub password_hash: String,
+}
+
 /// 创建用户请求
 #[derive(Debug, Deserialize, ToSchema, Validate)]
 #[serde(deny_unknown_fields)]

@@ -43,6 +43,13 @@ pub enum AppError {
     NotFound(&'static str),
     /// 请求方法不被路由允许，对应 `405` 与业务码 `40500`，提示语固定无需携带内容。
     MethodNotAllowed,
+    /// 未认证或凭证无效，对应 `401` 与业务码 `40100`。
+    ///
+    /// 登录失败统一使用该变体且提示语保持一致，避免通过响应差异区分
+    /// 「用户不存在」与「密码错误」，形成用户名枚举通道。
+    Unauthorized(&'static str),
+    /// 触发登录保护等频率限制，对应 `429` 与业务码 `42900`。
+    TooManyRequests(&'static str),
     /// 依赖服务不可用，例如数据库探测失败，对应 `503` 与业务码 `50300`。
     ServiceUnavailable(&'static str),
     /// 业务状态冲突，例如唯一键重复，对应 `409` 与业务码 `40900`。
@@ -102,6 +109,18 @@ impl IntoResponse for AppError {
                 StatusCode::METHOD_NOT_ALLOWED,
                 ApiCode::MethodNotAllowed,
                 "请求方法不被允许",
+                Vec::new(),
+            ),
+            Self::Unauthorized(message) => (
+                StatusCode::UNAUTHORIZED,
+                ApiCode::Unauthorized,
+                message,
+                Vec::new(),
+            ),
+            Self::TooManyRequests(message) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ApiCode::TooManyRequests,
+                message,
                 Vec::new(),
             ),
             Self::ServiceUnavailable(message) => (

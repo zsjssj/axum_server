@@ -1,4 +1,4 @@
-use crate::modules::user::model::User;
+use crate::modules::user::model::{User, UserCredentials};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -50,6 +50,47 @@ impl UserRepository {
         .await?;
 
         Ok(user)
+    }
+
+    /// 根据内部主键查询用户。
+    ///
+    /// 认证令牌的 `sub` 携带内部主键，受保护接口据此加载用户资料。
+    /// 返回公开的 [`User`]，不包含密码哈希。
+    pub async fn find_by_id(db: &PgPool, id: i64) -> Result<Option<User>, sqlx::Error> {
+        let user = sqlx::query_as::<_, User>(
+            r#"
+            SELECT public_id, username, email, nickname, created_at, updated_at
+            FROM users
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+
+        Ok(user)
+    }
+
+    /// 认证专用：按用户名查询内部主键与密码哈希。
+    ///
+    /// 返回 [`UserCredentials`] 而不是 [`User`]，使密码哈希无法顺着公开模型
+    /// 进入响应；查询条件使用唯一索引 `idx_users_username`。
+    pub async fn find_credentials_by_username(
+        db: &PgPool,
+        username: &str,
+    ) -> Result<Option<UserCredentials>, sqlx::Error> {
+        let credentials = sqlx::query_as::<_, UserCredentials>(
+            r#"
+            SELECT id, public_id, password_hash
+            FROM users
+            WHERE username = $1
+            "#,
+        )
+        .bind(username)
+        .fetch_optional(db)
+        .await?;
+
+        Ok(credentials)
     }
 
     /// 查询所有用户（分页）

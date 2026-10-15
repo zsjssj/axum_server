@@ -3,7 +3,7 @@ use crate::common::{
     error::{AppError, ErrorData},
     response::ApiResponse,
 };
-use crate::modules::user;
+use crate::modules::{auth, user};
 use axum::{
     Router,
     extract::State,
@@ -27,6 +27,7 @@ pub fn api_routes() -> Router<AppState> {
         "/api/v1",
         Router::new()
             .route("/hello", get(hello_handler))
+            .merge(auth::routes())
             .merge(user::routes()),
     )
 }

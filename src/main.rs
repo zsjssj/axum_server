@@ -20,17 +20,20 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::new()?; // 创建应用配置
+    // 先校验配置再初始化其他组件：弱 JWT 密钥等问题必须在监听端口之前暴露，
+    // 否则服务会带着可被伪造的令牌签发能力对外提供服务。
+    config.validate()?;
     init_tracing(&config.log.level); // 初始化日志系统
 
-    let db_pool: PgPool =
-        database::create_pool(&config.database.url, config.database.max_connections).await?; // 创建数据库连接池
+    let db_pool: PgPool = database::create_pool(&config.database.url, config.database.max_connections).await?; // 创建数据库连接池
     database::run_migrations(&db_pool).await?; // 在接收请求前完成数据库结构迁移
-    let app = create_app(db_pool); // 创建应用程序实例
+    let app = create_app(db_pool, &config); // 创建应用程序实例
     let address: String = config.server_address(); // 获取服务器地址
     let listener: tokio::net::TcpListener = tokio::net::TcpListener::bind(&address).await?; // 绑定服务器地址
 
     tracing::info!(%address, "server started"); // 记录服务器启动信息
-    axum::serve(listener, app).await?; // 启动服务器并监听请求
+    // 使用带连接信息的服务：登录与刷新接口依赖客户端 IP 做审计记录。
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?; // 启动服务器并监听请求
     Ok(())
 }
 

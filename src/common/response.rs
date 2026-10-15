@@ -43,16 +43,23 @@ impl ApiResponse<()> {
 }
 
 /// 数字业务码与 HTTP 状态码相互独立，便于客户端稳定处理和后续扩展。
+///
+/// 显式标注每个变体的数值，避免依赖枚举声明顺序导致业务码意外漂移。
 #[derive(Debug, Clone, Copy)]
 #[repr(i32)]
 pub enum ApiCode {
-    Success = 200, //接口成功
+    /// 成功。按接口契约固定为 `0`，与 HTTP 状态码 `200` 无关，因此不能复用 `200`。
+    Success = 0,
     BadRequest = 40000,
     ValidationError = 40001,
     UnsupportedMediaType = 40002,
+    /// 未认证或凭证无效。
+    Unauthorized = 40100,
     NotFound = 40400, //未知接口
     MethodNotAllowed = 40500,
     Conflict = 40900,
+    /// 触发登录保护等频率限制。
+    TooManyRequests = 42900,
     InternalError = 50000, //服务器错误
     ServiceUnavailable = 50300,
 }

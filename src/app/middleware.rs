@@ -29,6 +29,13 @@ pub async fn logging_middleware(request: Request, next: Next) -> Response {
 }
 
 /// CORS 配置
+///
+/// 当前放行任意来源，仅适用于开发联调。接入 Cookie 认证后必须注意一个约束：
+/// 浏览器的凭据模式（`credentials: 'include'`）**不接受通配来源**，服务端也不能
+/// 同时使用 `Any` 与 `allow_credentials(true)`，否则响应会被浏览器拒绝。
+///
+/// 因此前后端跨源部署时，必须把 `allow_origin` 改为具体的前端来源并启用
+/// `allow_credentials(true)`；同源部署（前端由本服务或同一域名提供）则不受影响。
 pub fn cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)

@@ -5,12 +5,16 @@ pub mod state;
 
 use crate::app::middleware::{cors_layer, logging_middleware};
 use crate::app::state::AppState;
+use crate::config::AppConfig;
 use axum::Router;
 use sqlx::PgPool;
 
 /// 创建 Axum 应用
-pub fn create_app(db_pool: PgPool) -> Router {
-    let state = AppState::new(db_pool);
+///
+/// 直接接收 [`AppConfig`] 而不是拆散的配置项：后续新增需要共享的配置
+/// 时无需再修改该函数签名和所有调用点。
+pub fn create_app(db_pool: PgPool, config: &AppConfig) -> Router {
+    let state = AppState::new(db_pool, config.jwt.clone(), config.auth.clone());
 
     Router::new()
         .merge(routes::health_routes())
@@ -36,11 +40,49 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
 
+    use crate::config::{AuthConfig, JwtConfig};
+
     fn test_app() -> Router {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://user:password@localhost/test")
             .expect("测试数据库连接字符串应合法");
-        create_app(pool)
+        create_app(pool, &test_config())
+    }
+
+    /// 构造测试用配置。
+    ///
+    /// 密钥长度需满足启动校验要求，否则相关断言会在校验阶段就失败。
+    fn test_config() -> AppConfig {
+        AppConfig {
+            server: crate::config::ServerConfig {
+                host: "127.0.0.1".to_owned(),
+                port: 3000,
+            },
+            database: crate::config::DatabaseConfig {
+                url: "postgres://user:password@localhost/test".to_owned(),
+                max_connections: 1,
+            },
+            log: crate::config::LogConfig {
+                level: "info".to_owned(),
+            },
+            jwt: JwtConfig {
+                secret: "integration-test-secret-32-characters".to_owned(),
+                issuer: "rust-axum-server-test".to_owned(),
+                access_ttl_minutes: 15,
+                refresh_ttl_days: 7,
+            },
+            auth: AuthConfig {
+                max_login_failures: 5,
+                login_window_minutes: 15,
+                cookie: crate::config::CookieConfig {
+                    access_name: "access_token".to_owned(),
+                    refresh_name: "refresh_token".to_owned(),
+                    secure: false,
+                    same_site: "strict".to_owned(),
+                    path: "/".to_owned(),
+                },
+            },
+        }
     }
 
     async fn request(method: Method, uri: &str, body: Body, content_type: bool) -> Response {
