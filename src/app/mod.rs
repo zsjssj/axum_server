@@ -9,6 +9,12 @@ use crate::config::AppConfig;
 use axum::Router;
 use sqlx::PgPool;
 
+use tower_http::{
+    LatencyUnit,
+    trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
+};
+use tracing::Level;
+
 /// 创建 Axum 应用
 ///
 /// 直接接收 [`AppConfig`] 而不是拆散的配置项：后续新增需要共享的配置
@@ -23,7 +29,12 @@ pub fn create_app(db_pool: PgPool, config: &AppConfig) -> Router {
         .fallback(routes::not_found_handler)
         .method_not_allowed_fallback(routes::method_not_allowed_handler)
         .layer(cors_layer())
-        .layer(axum::middleware::from_fn(logging_middleware))
+        // .layer(axum::middleware::from_fn(logging_middleware))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO).latency_unit(LatencyUnit::Millis)),
+        )
         .with_state(state)
 }
 
@@ -62,9 +73,7 @@ mod tests {
                 url: "postgres://user:password@localhost/test".to_owned(),
                 max_connections: 1,
             },
-            log: crate::config::LogConfig {
-                level: "info".to_owned(),
-            },
+            log: crate::config::LogConfig { level: "info".to_owned() },
             jwt: JwtConfig {
                 secret: "integration-test-secret-32-characters".to_owned(),
                 issuer: "rust-axum-server-test".to_owned(),
@@ -98,12 +107,7 @@ mod tests {
     }
 
     async fn json_body(response: Response) -> Value {
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("响应体应可读取")
-            .to_bytes();
+        let bytes = response.into_body().collect().await.expect("响应体应可读取").to_bytes();
         serde_json::from_slice(&bytes).expect("错误响应应为合法 JSON")
     }
 
@@ -143,23 +147,11 @@ mod tests {
 
     #[tokio::test]
     async fn returns_unified_error_for_invalid_query_and_path() {
-        let query_response = request(
-            Method::GET,
-            "/api/v1/users?page=0&page_size=101",
-            Body::empty(),
-            false,
-        )
-        .await;
+        let query_response = request(Method::GET, "/api/v1/users?page=0&page_size=101", Body::empty(), false).await;
         assert_eq!(query_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(json_body(query_response).await["code"], 40001);
 
-        let path_response = request(
-            Method::GET,
-            "/api/v1/users/not-a-uuid",
-            Body::empty(),
-            false,
-        )
-        .await;
+        let path_response = request(Method::GET, "/api/v1/users/not-a-uuid", Body::empty(), false).await;
         assert_eq!(path_response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(path_response).await["code"], 40000);
     }
@@ -170,8 +162,7 @@ mod tests {
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
         assert_eq!(json_body(not_found).await["code"], 40400);
 
-        let method_not_allowed =
-            request(Method::PATCH, "/api/v1/hello", Body::empty(), false).await;
+        let method_not_allowed = request(Method::PATCH, "/api/v1/hello", Body::empty(), false).await;
         assert_eq!(method_not_allowed.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(json_body(method_not_allowed).await["code"], 40500);
     }

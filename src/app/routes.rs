@@ -23,13 +23,7 @@ pub fn health_routes() -> Router<AppState> {
 
 /// API 路由
 pub fn api_routes() -> Router<AppState> {
-    Router::new().nest(
-        "/api/v1",
-        Router::new()
-            .route("/hello", get(hello_handler))
-            .merge(auth::routes())
-            .merge(user::routes()),
-    )
+    Router::new().nest("/api/v1", Router::new().route("/hello", get(hello_handler)).merge(auth::routes()).merge(user::routes()))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -94,9 +88,7 @@ pub struct ReadinessResponse {
         (status = 503, description = "数据库不可用", body = ApiResponse<ErrorData>)
     )
 )]
-pub(crate) async fn readiness_handler(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, AppError> {
+pub(crate) async fn readiness_handler(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     match sqlx::query("SELECT 1").execute(&state.db).await {
         Ok(_) => Ok(Json(ApiResponse::success(
             "请求成功",

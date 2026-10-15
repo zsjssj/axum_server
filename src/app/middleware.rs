@@ -37,8 +37,5 @@ pub async fn logging_middleware(request: Request, next: Next) -> Response {
 /// 因此前后端跨源部署时，必须把 `allow_origin` 改为具体的前端来源并启用
 /// `allow_credentials(true)`；同源部署（前端由本服务或同一域名提供）则不受影响。
 pub fn cors_layer() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
+    CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)
 }

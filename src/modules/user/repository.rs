@@ -7,14 +7,7 @@ pub struct UserRepository;
 
 impl UserRepository {
     /// 创建用户
-    pub async fn create(
-        db: &PgPool,
-        public_id: Uuid,
-        username: &str,
-        email: &str,
-        password_hash: &str,
-        nickname: Option<&str>,
-    ) -> Result<User, sqlx::Error> {
+    pub async fn create(db: &PgPool, public_id: Uuid, username: &str, email: &str, password_hash: &str, nickname: Option<&str>) -> Result<User, sqlx::Error> {
         let user = sqlx::query_as::<_, User>(
             r#"
             INSERT INTO users (public_id, username, email, password_hash, nickname)
@@ -34,10 +27,7 @@ impl UserRepository {
     }
 
     /// 根据公开 ID 查询用户
-    pub async fn find_by_public_id(
-        db: &PgPool,
-        public_id: Uuid,
-    ) -> Result<Option<User>, sqlx::Error> {
+    pub async fn find_by_public_id(db: &PgPool, public_id: Uuid) -> Result<Option<User>, sqlx::Error> {
         let user = sqlx::query_as::<_, User>(
             r#"
             SELECT public_id, username, email, nickname, created_at, updated_at
@@ -75,10 +65,7 @@ impl UserRepository {
     ///
     /// 返回 [`UserCredentials`] 而不是 [`User`]，使密码哈希无法顺着公开模型
     /// 进入响应；查询条件使用唯一索引 `idx_users_username`。
-    pub async fn find_credentials_by_username(
-        db: &PgPool,
-        username: &str,
-    ) -> Result<Option<UserCredentials>, sqlx::Error> {
+    pub async fn find_credentials_by_username(db: &PgPool, username: &str) -> Result<Option<UserCredentials>, sqlx::Error> {
         let credentials = sqlx::query_as::<_, UserCredentials>(
             r#"
             SELECT id, public_id, password_hash
@@ -94,11 +81,7 @@ impl UserRepository {
     }
 
     /// 查询所有用户（分页）
-    pub async fn find_all(
-        db: &PgPool,
-        page: i64,
-        page_size: i64,
-    ) -> Result<Vec<User>, sqlx::Error> {
+    pub async fn find_all(db: &PgPool, page: i64, page_size: i64) -> Result<Vec<User>, sqlx::Error> {
         let offset = (page - 1) * page_size;
 
         let users = sqlx::query_as::<_, User>(
@@ -119,20 +102,12 @@ impl UserRepository {
 
     /// 统计用户总数
     pub async fn count(db: &PgPool) -> Result<i64, sqlx::Error> {
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
-            .fetch_one(db)
-            .await?;
-
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(db).await?;
         Ok(count)
     }
 
     /// 更新用户
-    pub async fn update(
-        db: &PgPool,
-        public_id: Uuid,
-        email: Option<&str>,
-        nickname: Option<&str>,
-    ) -> Result<Option<User>, sqlx::Error> {
+    pub async fn update(db: &PgPool, public_id: Uuid, email: Option<&str>, nickname: Option<&str>) -> Result<Option<User>, sqlx::Error> {
         let user = sqlx::query_as::<_, User>(
             r#"
             UPDATE users
@@ -154,10 +129,7 @@ impl UserRepository {
 
     /// 删除用户
     pub async fn delete(db: &PgPool, public_id: Uuid) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM users WHERE public_id = $1")
-            .bind(public_id)
-            .execute(db)
-            .await?;
+        let result = sqlx::query("DELETE FROM users WHERE public_id = $1").bind(public_id).execute(db).await?;
 
         Ok(result.rows_affected() > 0)
     }
