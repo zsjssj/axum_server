@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use crate::app::state::AppState;
 use crate::common::{
+    auth::{LOGIN_PATH, LOGOUT_PATH, REFRESH_PATH},
     auth_extractor::CurrentUser,
     cookie::{self, build_clear_cookie, build_token_cookie},
     error::{AppError, ErrorData},
@@ -23,12 +24,15 @@ use crate::modules::auth::{
 
 /// 认证路由。
 ///
-/// 统一挂载在 `/auth` 下，由 `app::routes` 组合到 `/api/v1` 前缀中。
+/// 统一挂载在 `app::routes::api_routes` 的 `/api/v1` 前缀之下；这里使用相对路径，
+/// 其中三个认证入口直接引用 `common::auth` 中的白名单常量，使「注册的路由」与
+/// 「匿名放行的白名单」共用同一个定义——两处分叉会直接导致客户端无法登录，
+/// 或某个受保护路径被意外放行。
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/auth/login", post(login))
-        .route("/auth/refresh", post(refresh_token))
-        .route("/auth/logout", post(logout))
+        .route(LOGIN_PATH, post(login))
+        .route(REFRESH_PATH, post(refresh_token))
+        .route(LOGOUT_PATH, post(logout))
         .route("/auth/me", get(current_user))
 }
 

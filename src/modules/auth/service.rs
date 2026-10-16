@@ -187,6 +187,40 @@ impl AuthService {
             .map_err(|_| AppError::Unauthorized("认证令牌无效"))
     }
 
+    /// 签发一个 access token，仅供测试构造已登录请求使用。
+    ///
+    /// 存在的原因：认证中间件挂在 `/api/v1` 整组路由上，任何端到端测试都必须
+    /// 先构造合法令牌。测试若自行拼装 JWT，就会与生产签发逻辑分叉——真实实现
+    /// 改变声明后测试仍会通过，覆盖价值随之消失。因此这里复用同一个
+    /// [`AccessClaims`] 结构，只把有效期交给调用方指定。
+    ///
+    /// 使用 `#[doc(hidden)]` 而不是 `#[cfg(test)]`：`cfg(test)` 只在编译 crate
+    /// 自身的测试目标时生效，`tests/` 下的集成测试属于独立 crate，看不到该函数。
+    /// 生产构建中它不会被任何代码调用，因此显式允许 `dead_code`，
+    /// 而不是为它引入一个只为测试存在的 feature 开关。
+    ///
+    /// `expires_at` 是 `exp` 声明的绝对值（Unix 秒），测试可传一个极大的取值
+    /// 得到「长期有效」的令牌；`iat` 固定为 0，避免用例结果受当前时间影响。
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn issue_test_access_token(jwt_config: &JwtConfig, user_id: i64, expires_at: i64) -> String {
+        let claims = AccessClaims {
+            sub: user_id.to_string(),
+            iss: jwt_config.issuer.clone(),
+            exp: expires_at,
+            iat: 0,
+            jti: format!("test-{user_id}"),
+            typ: TOKEN_TYPE_ACCESS.to_owned(),
+        };
+
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(jwt_config.secret.as_bytes()),
+        )
+        .expect("测试用 access token 应签发成功")
+    }
+
     /// 加载当前登录用户的公开资料。
     pub async fn current_user(db: &PgPool, user_id: i64) -> Result<CurrentUserResponse, AppError> {
         let user = UserRepository::find_by_id(db, user_id)

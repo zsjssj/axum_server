@@ -22,8 +22,24 @@ pub fn health_routes() -> Router<AppState> {
 }
 
 /// API 路由
-pub fn api_routes() -> Router<AppState> {
-    Router::new().nest("/api/v1", Router::new().route("/hello", get(hello_handler)).merge(auth::routes()).merge(user::routes()))
+///
+/// 认证中间件加在 `nest` 之后的整个 `/api/v1` 路由组上，而不是逐个接口声明：
+/// 这样默认行为就是「需要登录」，新增接口天然受保护，漏写认证不会造成匿名暴露。
+/// 例外清单（登录、刷新、登出）集中在 `common::auth::require_login` 中维护。
+///
+/// 这里显式接收 `AppState`：`nest` 之后内部 Router 的状态类型已经解析为具体类型，
+/// 中间件无法再依赖外层的 `with_state` 注入（`from_fn` 要求自行解析 `State`）。
+/// 使用 `from_fn_with_state` 把状态绑定到中间件上，`State` 提取才能正常工作。
+pub fn api_routes(state: AppState) -> Router<AppState> {
+    let api = Router::new()
+        .route("/hello", get(hello_handler))
+        .merge(auth::routes())
+        .merge(user::routes())
+        // 用 `route_layer` 而不是 `layer`：它明确只作用于已匹配到路由的请求，
+        // 中间件不会因为被降到外层 fallback 而误判不存在的路径。
+        .route_layer(axum::middleware::from_fn_with_state(state, crate::common::auth::require_login));
+
+    Router::new().nest("/api/v1", api)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -111,11 +127,17 @@ pub struct HelloResponse {
     timestamp: String,
 }
 /// 示例 API 处理器
+///
+/// 虽然只是一个示例接口，但它同样位于受保护的 `/api/v1` 之下，
+/// 未登录时会被认证中间件拦截并返回 `401`。
 #[utoipa::path(
     get,
     path = "/api/v1/hello",
     tag = "系统",
-    responses((status = 200, description = "示例接口", body = ApiResponse<HelloResponse>))
+    responses(
+        (status = 200, description = "示例接口", body = ApiResponse<HelloResponse>),
+        (status = 401, description = "未登录或登录已过期", body = ApiResponse<ErrorData>)
+    )
 )]
 pub(crate) async fn hello_handler() -> impl IntoResponse {
     Json(ApiResponse::success(

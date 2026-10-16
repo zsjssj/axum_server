@@ -118,4 +118,45 @@ mod tests {
             "Cookie 方案下不应存在 bearer_auth 安全方案"
         );
     }
+
+    /// 受保护接口必须在文档中声明 `401`。
+    ///
+    /// 认证由中间件统一强制，Handler 签名上看不出这一点，因此注解是调用方
+    /// 判断「该接口是否需要登录」的唯一直观依据；漏写会让文档把它显示成匿名接口。
+    #[test]
+    fn openapi_declares_unauthorized_for_protected_routes() {
+        let document = ApiDoc::openapi();
+
+        for path in [
+            "/api/v1/users",
+            "/api/v1/users/{public_id}",
+            "/api/v1/auth/me",
+            "/api/v1/hello",
+        ] {
+            let item = document
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("应注册路径 {path}"));
+            let operations = [
+                ("get", item.get.as_ref()),
+                ("post", item.post.as_ref()),
+                ("put", item.put.as_ref()),
+                ("delete", item.delete.as_ref()),
+            ];
+
+            let mut checked = 0;
+            for (method, operation) in operations {
+                let Some(operation) = operation else { continue };
+                checked += 1;
+
+                assert!(
+                    operation.responses.responses.contains_key("401"),
+                    "{method} {path} 缺少 401 响应声明"
+                );
+            }
+
+            assert!(checked > 0, "{path} 应至少声明一个方法");
+        }
+    }
 }

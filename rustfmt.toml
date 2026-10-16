@@ -1,4 +1,4 @@
-max_width = 180                    # 每行最大长度
+max_width = 160                    # 每行最大长度
 hard_tabs = false                  # 是否使用 Tab 键缩进
 tab_spaces = 4                     # Tab 键等于多少个空格
 newline_style = "Auto"             # 换行符风格，Auto、Unix、Windows

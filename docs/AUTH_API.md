@@ -58,6 +58,26 @@
 
 刷新与登出接口**没有请求体**：令牌直接取自请求 Cookie。请求体中的多余字段会被拒绝。
 
+### `/api/v1` 下的接口默认需要登录
+
+登录校验由认证中间件在 `/api/v1` 路由组上统一强制，**只有上表中登录、刷新、登出三个入口是匿名可访问的**，其余接口（包括用户接口与示例接口 `/api/v1/hello`）未登录时一律返回：
+
+```json
+{
+  "code": 40100,
+  "message": "未登录或登录已过期",
+  "data": null
+}
+```
+
+判断依据与失败原因：
+
+- 请求没有 `access_token` Cookie → `401`、`未登录或登录已过期`。
+- Cookie 存在但 JWT 过期 → `401`、`认证令牌已过期`，此时应调用 `/auth/refresh`。
+- 签名、签发者或 `typ` 声明不合法 → `401`、`认证令牌无效` / `认证令牌类型错误`。
+
+未注册的 `/api/v1` 路径不受该中间件影响，直接返回 `404`（`40400`）：认证中间件只作用于已匹配到路由的请求，不存在的接口不必先要求登录。
+
 ### 登出必须清除两个 Cookie
 
 登出响应会同时下发两个 `Max-Age=0` 的清除 Cookie，且属性（`Path`、`HttpOnly`、`Secure`、`SameSite`）与下发时完全一致。浏览器按名称、域和路径匹配 Cookie，属性不一致会导致清除失败、令牌残留在客户端。
@@ -73,6 +93,17 @@ Cookie 会自动随请求发送，因此必须防 CSRF。本方案采用三层�
 3. **不提供 `GET` 状态的写操作**：所有改变认证状态的操作都是 `POST`。
 
 需要注意的残余风险：若将 `same_site` 放宽为 `Lax`，则从外部站点发起的顶层 `GET` 导航会携带 Cookie。当前所有写操作均为 `POST`，因此该风险不影响认证状态。**生产环境仍应配合 CORS 白名单收紧来源。**
+
+### 跨源部署必须同时改 CORS
+
+`/api/v1` 下的接口默认需要登录后，跨源部署的失败模式会集中暴露在 CORS 配置上：浏览器在凭据模式下**不接受通配来源**，服务端也不能同时使用 `Any` 与 `allow_credentials(true)`。
+
+当前的 `cors_layer()` 放行任意来源且未开启凭据支持，只适用于同源部署或非浏览器调用（如 curl）。若前端与后端不同源，必须把它改成：
+
+- `allow_origin` 指定**具体的前端来源**，不能用 `Any`；
+- 启用 `allow_credentials(true)`，否则浏览器不会携带令牌 Cookie。
+
+否则现象是「登录接口本身返回成功，但后续接口全部 401」——因为浏览器根本没有把 `Set-Cookie` 下发的令牌带回来。前端侧还需要设置 `credentials: 'include'`（fetch）或 `withCredentials = true`（axios）。
 
 ## 双令牌设计
 
@@ -163,7 +194,7 @@ Set-Cookie: refresh_token=3f1a9c2e5b7d...; HttpOnly; SameSite=Strict; Path=/; Ma
 
 ## 命令行示例
 
-浏览器会自动管理 Cookie，命令行调试需要用 `-c` 写入、`-b` 读取 Cookie 文件：
+浏览器会自动管理 Cookie，命令行调试需要用 `-c` 写入、`-b` 读取 Cookie 文件。由于 `/api/v1` 下的接口默认需要登录，**先登录再调用其他接口**是必须的：
 
 ```bash
 # 1. 登录并把令牌 Cookie 保存到文件
@@ -171,8 +202,9 @@ curl -c cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"testuser","password":"password123"}'
 
-# 2. 携带 Cookie 访问受保护接口
+# 2. 携带 Cookie 访问受保护接口（不带 Cookie 时会得到 401）
 curl -b cookies.txt http://127.0.0.1:3000/api/v1/auth/me
+curl -b cookies.txt "http://127.0.0.1:3000/api/v1/users?page=1&page_size=10"
 
 # 3. 刷新令牌（Cookie 文件会在响应后更新，请加上 -c 覆盖保存）
 curl -b cookies.txt -c cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/refresh
@@ -180,6 +212,8 @@ curl -b cookies.txt -c cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/ref
 # 4. 登出
 curl -b cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/logout
 ```
+
+若 `auth.cookie.path` 被改为 `/api/v1` 等子路径，Cookie 不会发送到该路径之外，`cookies.txt` 中的记录也会相应带路径属性，命令行调试时需注意路径匹配。
 
 ## 配置项
 
@@ -221,6 +255,8 @@ curl -b cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/logout
 - `modules/auth/handler.rs`：路由、Cookie 下发与 `utoipa::path` 注解。
 - `modules/auth/model.rs`：请求与响应 Schema。
 - `common/cookie.rs`：Cookie 的构建、解析与安全属性。
+- `common/auth.rs`：登录校验中间件与匿名白名单。调整 `/api/v1` 下的路由或认证入口时必须同步检查这里。
+- `app/routes.rs`：`/api/v1` 路由组与认证中间件的挂载。
 - `app/openapi.rs`：统一注册接口与 Schema。
 
 完成修改后运行：

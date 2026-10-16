@@ -8,6 +8,7 @@ use axum::{
 
 use crate::app::state::AppState;
 use crate::common::{
+    auth_extractor::CurrentUser,
     error::{AppError, ErrorData},
     extractor::{ApiPath, ValidatedJson, ValidatedQuery},
     pagination::{PaginatedResponse, Pagination},
@@ -20,6 +21,10 @@ use crate::modules::user::{
 use uuid::Uuid;
 
 /// 用户路由
+///
+/// 用户资料属于受保护资源，本模块全部接口都要求已登录：认证由挂在
+/// `/api/v1` 上的认证中间件统一强制，这里在 Handler 签名中声明
+/// `CurrentUser` 只是显式表达「该接口需要身份」的意图。
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/users", get(list_users).post(create_user))
@@ -38,6 +43,7 @@ pub fn routes() -> Router<AppState> {
     responses(
         (status = 201, description = "用户创建成功", body = ApiResponse<User>),
         (status = 400, description = "JSON 请求体格式错误", body = ApiResponse<ErrorData>),
+        (status = 401, description = "未登录或登录已过期", body = ApiResponse<ErrorData>),
         (status = 415, description = "请求体媒体类型错误", body = ApiResponse<ErrorData>),
         (status = 422, description = "请求参数校验失败", body = ApiResponse<ErrorData>),
         (status = 409, description = "用户名已存在", body = ApiResponse<ErrorData>),
@@ -46,6 +52,7 @@ pub fn routes() -> Router<AppState> {
 )]
 pub(crate) async fn create_user(
     State(state): State<AppState>,
+    _current_user: CurrentUser,
     ValidatedJson(req): ValidatedJson<CreateUserRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let user = UserService::create_user(&state.db, req).await?;
@@ -65,12 +72,14 @@ pub(crate) async fn create_user(
     responses(
         (status = 200, description = "分页用户列表", body = ApiResponse<PaginatedResponse<User>>),
         (status = 400, description = "查询参数格式错误", body = ApiResponse<ErrorData>),
+        (status = 401, description = "未登录或登录已过期", body = ApiResponse<ErrorData>),
         (status = 422, description = "分页参数校验失败", body = ApiResponse<ErrorData>),
         (status = 500, description = "服务器内部错误", body = ApiResponse<ErrorData>)
     )
 )]
 pub(crate) async fn list_users(
     State(state): State<AppState>,
+    _current_user: CurrentUser,
     ValidatedQuery(pagination): ValidatedQuery<Pagination>,
 ) -> Result<impl IntoResponse, AppError> {
     let (users, total) =
@@ -89,12 +98,14 @@ pub(crate) async fn list_users(
     responses(
         (status = 200, description = "用户详情", body = ApiResponse<User>),
         (status = 400, description = "路径参数格式错误", body = ApiResponse<ErrorData>),
+        (status = 401, description = "未登录或登录已过期", body = ApiResponse<ErrorData>),
         (status = 404, description = "用户不存在", body = ApiResponse<ErrorData>),
         (status = 500, description = "服务器内部错误", body = ApiResponse<ErrorData>)
     )
 )]
 pub(crate) async fn get_user(
     State(state): State<AppState>,
+    _current_user: CurrentUser,
     ApiPath(public_id): ApiPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let user = UserService::get_user_by_public_id(&state.db, public_id).await?;
@@ -111,6 +122,7 @@ pub(crate) async fn get_user(
     responses(
         (status = 200, description = "用户更新成功", body = ApiResponse<User>),
         (status = 400, description = "请求体或路径参数格式错误", body = ApiResponse<ErrorData>),
+        (status = 401, description = "未登录或登录已过期", body = ApiResponse<ErrorData>),
         (status = 415, description = "请求体媒体类型错误", body = ApiResponse<ErrorData>),
         (status = 422, description = "请求参数校验失败", body = ApiResponse<ErrorData>),
         (status = 404, description = "用户不存在", body = ApiResponse<ErrorData>),
@@ -119,6 +131,7 @@ pub(crate) async fn get_user(
 )]
 pub(crate) async fn update_user(
     State(state): State<AppState>,
+    _current_user: CurrentUser,
     ApiPath(public_id): ApiPath<Uuid>,
     ValidatedJson(req): ValidatedJson<UpdateUserRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -136,12 +149,14 @@ pub(crate) async fn update_user(
     responses(
         (status = 200, description = "用户删除成功", body = ApiResponse<EmptyData>),
         (status = 400, description = "路径参数格式错误", body = ApiResponse<ErrorData>),
+        (status = 401, description = "未登录或登录已过期", body = ApiResponse<ErrorData>),
         (status = 404, description = "用户不存在", body = ApiResponse<ErrorData>),
         (status = 500, description = "服务器内部错误", body = ApiResponse<ErrorData>)
     )
 )]
 pub(crate) async fn delete_user(
     State(state): State<AppState>,
+    _current_user: CurrentUser,
     ApiPath(public_id): ApiPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     UserService::delete_user(&state.db, public_id).await?;

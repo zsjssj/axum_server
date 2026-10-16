@@ -1,14 +1,17 @@
 use axum::{async_trait, extract::FromRequestParts, http::request::Parts};
 
 use crate::app::state::AppState;
-use crate::common::cookie;
+use crate::common::auth::AuthUser;
 use crate::common::error::AppError;
-use crate::modules::auth::service::AuthService;
 
 /// 已认证用户身份。
 ///
-/// 以提取器的形式提供认证能力：Handler 签名中出现 `CurrentUser` 即表示该接口
-/// 需要登录，意图直接体现在类型上，无需回看路由配置或中间件注册顺序。
+/// Handler 签名中出现 `CurrentUser` 即表示该接口需要登录，身份来源是
+/// [`crate::common::auth::require_login`] 中间件写入请求扩展的 [`AuthUser`]。
+///
+/// 提取器本身不再解析 Cookie：令牌校验集中在中间件中完成，一处校验、
+/// 一处失败响应；若两边各自校验，同一请求会被重复解码，后续新增校验规则时
+/// 也极易出现「中间件放了、提取器没放」的不一致。
 #[derive(Debug, Clone, Copy)]
 pub struct CurrentUser {
     /// 用户内部主键，取自 access token 的 `sub`。
@@ -21,17 +24,20 @@ impl FromRequestParts<AppState> for CurrentUser {
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState,
+        _state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // 令牌只从 HttpOnly Cookie 读取，不接受 `Authorization` 头。
-        // 保留单一来源可以避免出现绕过 Cookie 安全属性的旁路认证方式，
-        // 也避免"某条路径漏校验 Cookie"的差异化处理。
-        let token = cookie::access_token_from_headers(&parts.headers, &state.auth.cookie)
-            .ok_or(AppError::Unauthorized("缺少认证令牌"))?;
-
-        let user_id = AuthService::verify_access_token(&state.jwt, &token)?;
-
-        Ok(Self { user_id })
+        // 扩展缺失说明该路由没有经过认证中间件。这种情况必须失败关闭而不是
+        // 放行为匿名访问，否则一次路由改写就可能静默地把接口暴露出去。
+        parts
+            .extensions
+            .get::<AuthUser>()
+            .map(|user| Self {
+                user_id: user.user_id,
+            })
+            .ok_or_else(|| {
+                tracing::error!(uri = %parts.uri, "请求缺少认证中间件注入的用户身份");
+                AppError::Internal("认证上下文缺失")
+            })
     }
 }
 
@@ -67,10 +73,9 @@ mod tests {
         }
     }
 
-    fn parts_with_cookie(value: &str) -> Parts {
+    fn parts() -> Parts {
         let request = axum::http::Request::builder()
             .uri("/api/v1/auth/me")
-            .header(axum::http::header::COOKIE, value)
             .body(())
             .expect("测试请求应构造成功");
         let (parts, ()) = request.into_parts();
@@ -78,48 +83,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_request_without_token_cookie() {
+    async fn reads_user_from_request_extensions() {
         let state = test_state();
-        let mut parts = parts_with_cookie("other=1");
+        let mut parts = parts();
+        parts.extensions.insert(AuthUser { user_id: 42 });
+
+        let user = CurrentUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("已注入身份的请求应提取成功");
+
+        assert_eq!(user.user_id, 42);
+    }
+
+    /// 没有经过认证中间件的请求必须失败关闭，而不是被当成匿名访问放行。
+    #[tokio::test]
+    async fn fails_closed_without_authenticated_user() {
+        let state = test_state();
+        let mut parts = parts();
 
         let result = CurrentUser::from_request_parts(&mut parts, &state).await;
 
         match result {
-            Err(AppError::Unauthorized(message)) => assert_eq!(message, "缺少认证令牌"),
-            other => panic!("缺少令牌时应返回 401，实际为 {other:?}"),
+            Err(AppError::Internal(message)) => assert_eq!(message, "认证上下文缺失"),
+            other => panic!("缺少认证上下文时应返回内部错误，实际为 {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_token_cookie() {
-        let state = test_state();
-        let mut parts = parts_with_cookie("access_token=not-a-valid-jwt");
-
-        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
-
-        assert!(
-            matches!(result, Err(AppError::Unauthorized(_))),
-            "非法令牌必须被拒绝"
-        );
-    }
-
-    /// 提取器必须只信任 Cookie：`Authorization` 头不再被接受，
-    /// 避免出现绕过 Cookie 安全属性的旁路认证方式。
-    #[tokio::test]
-    async fn ignores_authorization_header() {
-        let state = test_state();
-        let request = axum::http::Request::builder()
-            .uri("/api/v1/auth/me")
-            .header(axum::http::header::AUTHORIZATION, "Bearer some.jwt.value")
-            .body(())
-            .expect("测试请求应构造成功");
-        let (mut parts, ()) = request.into_parts();
-
-        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
-
-        assert!(
-            matches!(result, Err(AppError::Unauthorized(_))),
-            "Authorization 头不应被接受"
-        );
     }
 }

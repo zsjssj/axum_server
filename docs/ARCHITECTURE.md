@@ -26,11 +26,11 @@ rust-axum-server/
 ├── migrations/             # 数据库迁移脚本
 └── src/
     ├── app/                # 应用装配、全局状态、路由和中间件
-    ├── common/             # 跨业务模块复用的错误、分页等能力
+    ├── common/             # 跨业务模块复用的能力：错误边界、分页、Cookie、登录校验等
     ├── config/             # 配置结构定义与加载逻辑
     ├── infrastructure/     # 数据库等外部基础设施适配
     ├── modules/            # 业务模块
-    │   ├── auth/           # 认证模块：登录、令牌刷新、登出
+    │   ├── auth/           # 认证模块：登录、令牌刷新、登出、当前用户
     │   └── user/           # 用户模块
     └── main.rs             # 程序入口与启动流程
 ```
@@ -149,13 +149,27 @@ non-UTF-8 string for its error message.
 
 ### 受保护接口的认证流程
 
-以 `GET /api/v1/auth/me` 为例：
+`/api/v1` 下的**全部接口默认需要登录**，认证由 `common::auth::require_login` 中间件在路由组上统一强制。以 `GET /api/v1/auth/me` 为例：
 
 1. 请求先经过 CORS 与日志中间件。
-2. Handler 提取 `CurrentUser`。该提取器从 `access_token` Cookie 读取 JWT，校验签名、签发者、有效期与 `typ` 声明，并把任何失败转换为统一的 `AppError::Unauthorized`。
-3. 认证通过后 Handler 再提取 `State` 与业务参数，后续流程与匿名接口一致。
+2. 请求进入 `/api/v1` 路由组后先经过认证中间件。中间件从 `access_token` Cookie 读取 JWT，校验签名、签发者、有效期与 `typ` 声明，并把任何失败转换为统一的 `AppError::Unauthorized`（`401`，业务码 `40100`）。
+3. 校验通过后，中间件把用户身份写入请求扩展；Handler 再提取 `State`、`CurrentUser` 与业务参数，后续流程与匿名接口一致。
+4. `CurrentUser` 提取器只从请求扩展读取身份，不再次解析 Cookie。Handler 签名中出现 `CurrentUser` 表示该接口需要登录，身份来源由中间件保证。
 
-`CurrentUser` 是提取器而不是全局中间件：Handler 签名中出现该类型即表示接口需要登录，认证要求直接体现在类型上，不需要回看路由配置或中间件注册顺序。令牌**只从 Cookie 读取**，不接受 `Authorization` 头，避免出现绕过 Cookie 安全属性的旁路认证方式。
+选择「中间件默认拒绝 + 显式白名单」而不是逐个 Handler 声明认证，原因是失效方向：漏写一处认证只会被评审发现，而默认拒绝会让任何新增接口天然受保护。白名单只有三项，且与路由注册共用同一组常量（`common::auth` 的 `LOGIN_PATH`、`REFRESH_PATH`、`LOGOUT_PATH`）：
+
+| 匿名可访问 | 不可移除的理由 |
+| --- | --- |
+| `POST /api/v1/auth/login` | 登录本身必须匿名，否则无法获得凭证 |
+| `POST /api/v1/auth/refresh` | access token 过期后客户端只剩刷新 Cookie，否则刷新流程永远无法启动 |
+| `POST /api/v1/auth/logout` | 登出必须幂等，令牌已失效时仍要能清理会话 |
+
+两点实现约束：
+
+- 中间件挂在 `nest` 之后，而 `nest` 会剥离 `/api/v1` 前缀，因此中间件看到的路径是 `/auth/login` 这样的相对路径。`is_public_path` 同时接受完整路径与相对路径，避免有人按完整路径写白名单后造成静默错误。
+- 使用的是 `route_layer` 而不是 `layer`：中间件只作用于已匹配到路由的请求，未注册的路径直接落到 `404` fallback，不会因为认证失败先返回 `401`。
+
+令牌**只从 Cookie 读取**，不接受 `Authorization` 头，避免出现绕过 Cookie 安全属性的旁路认证方式。
 
 ## 6. 认证与令牌设计
 
@@ -199,12 +213,15 @@ Cookie 会自动随请求发送，因此必须防 CSRF。主要防线是 `SameSi
 
 ## 7. 全局状态与中间件
 
-`AppState` 保存可以安全共享的应用级依赖：`PgPool`、`Arc<JwtConfig>` 与 `Arc<AuthConfig>`。Axum 会克隆 State，但 `PgPool` 内部使用共享句柄、配置项使用 `Arc`，因此不会为每次请求复制连接池或配置内容。认证配置随状态共享，使提取器可以在校验令牌时直接访问 JWT 密钥，而不必让每个受保护的 Handler 多一个依赖参数。
+`AppState` 保存可以安全共享的应用级依赖：`PgPool`、`Arc<JwtConfig>` 与 `Arc<AuthConfig>`。Axum 会克隆 State，但 `PgPool` 内部使用共享句柄、配置项使用 `Arc`，因此不会为每次请求复制连接池或配置内容。认证配置随状态共享，使认证中间件可以在校验令牌时直接访问 JWT 密钥，而不必让每个受保护的 Handler 多一个依赖参数。
 
 当前中间件包括：
 
 - 日志中间件：记录方法、URI、响应状态和处理耗时。
 - CORS 中间件：当前允许任意来源、方法和请求头，便于开发联调；生产环境应根据实际前端域名收紧规则。若前端与后端跨源部署，**必须启用凭据支持并指定具体来源**，因为浏览器不会在通配来源下携带 Cookie。
+- 认证中间件（`common::auth::require_login`）：只作用于 `/api/v1` 路由组中已匹配到路由的请求，按白名单放行认证入口，其余请求一律要求有效的 access token Cookie。
+
+中间件的挂载顺序会影响失败响应：认证中间件在内层，因此 `/api/v1` 下未登录的请求先得到 `401`，不会落到外层的 404、405 fallback。
 
 新增全局依赖时，应优先加入 `AppState`，由 Handler 通过 `State` 提取，避免使用全局可变变量。
 
@@ -263,9 +280,10 @@ src/modules/{module}/
 4. 在 `handler.rs` 定义路由和 HTTP 适配逻辑。
 5. 在模块的 `mod.rs` 暴露路由入口。
 6. 在 `src/modules/mod.rs` 注册模块。
-7. 在 `src/app/routes.rs` 合并模块路由。
-8. 在 `src/app/openapi.rs` 注册新增的接口与 Schema。
-9. 补充迁移、测试和对应 API 文档。
+7. 在 `src/app/routes.rs` 合并模块路由到 `/api/v1` 路由组。挂在该组下的接口**自动需要登录**，无需额外声明；只有当接口确实应当匿名可访问时，才需要把它加入 `common::auth` 的白名单并说明理由。
+8. 需要当前用户身份时，在 Handler 签名中声明 `common::auth_extractor::CurrentUser`。
+9. 在 `src/app/openapi.rs` 注册新增的接口与 Schema，并为受保护接口补上 `401` 响应。
+10. 补充迁移、测试和对应 API 文档。
 
 跨模块复用的能力应下沉到 `common`，而不是让一个业务模块引用另一个业务模块的内部实现。例如密码哈希原本定义在用户模块中，认证模块也需要相同的 Argon2 参数，于是抽取为 `common::password`；两处独立实现很容易在参数上逐渐分叉，导致同一密码在不同入口得到强度不一致的哈希。
 
@@ -301,6 +319,6 @@ src/modules/{module}/
 - 查询参数模型通过 `IntoParams` 生成参数定义。
 - `src/app/openapi.rs` 汇总所有接口和模型，并挂载 Swagger UI。
 
-认证采用 Cookie 方案，因此**不注册 `bearer_auth` 安全方案**：残留的 Bearer 方案会让调用方误以为存在 `Authorization` 头这条认证路径。
+认证采用 Cookie 方案，因此**不注册 `bearer_auth` 安全方案**：残留的 Bearer 方案会让调用方误以为存在 `Authorization` 头这条认证路径。同理也不注册 `apiKey` 形式的 Cookie 安全方案——OpenAPI 的 `apiKey` 只能声明「安全方案」，无法表达 HttpOnly、SameSite 等实际生效的约束，不如在接口描述与文档中说明。
 
-服务启动后可通过 `/swagger-ui/` 浏览交互式文档，通过 `/api-docs/openapi.json` 获取 OpenAPI JSON。新增或调整接口时，必须同步调整代码注解；手写 Markdown 只保留使用说明，不再重复维护完整的接口结构。各模块文档见 `docs/USER_API.md` 与 `docs/AUTH_API.md`。
+服务启动后可通过 `/swagger-ui/` 浏览交互式文档，通过 `/api-docs/openapi.json` 获取 OpenAPI JSON。**经 Swagger UI 调试受保护接口前，需要先调用登录接口**，浏览器会把返回的 Cookie 自动带上（Swagger UI 的请求与页面同源，因此能携带 Cookie）。新增或调整接口时，必须同步调整代码注解；手写 Markdown 只保留使用说明，不再重复维护完整的接口结构。各模块文档见 `docs/USER_API.md` 与 `docs/AUTH_API.md`。

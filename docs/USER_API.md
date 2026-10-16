@@ -13,7 +13,7 @@ Swagger UI 支持查看 Schema、展开接口详情并直接发起调试请求�
 
 ## 用户接口
 
-用户接口基础路径为 `/api/v1/users`：
+用户接口基础路径为 `/api/v1/users`。**本模块全部接口都要求已登录**：
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -22,6 +22,8 @@ Swagger UI 支持查看 Schema、展开接口详情并直接发起调试请求�
 | `GET` | `/api/v1/users/{public_id}` | 获取用户详情 |
 | `PUT` | `/api/v1/users/{public_id}` | 更新用户 |
 | `DELETE` | `/api/v1/users/{public_id}` | 删除用户 |
+
+未携带有效 `access_token` Cookie 时，上述接口一律返回 `401`（业务码 `40100`，`message` 为 `未登录或登录已过期`），不会进入业务逻辑，也不会返回参数校验错误。认证要求由 `/api/v1` 路由组上的认证中间件统一强制，详见[认证模块 API 文档](./AUTH_API.md)。
 
 用户响应中的 `public_id` 是服务端生成的 UUIDv7，也是用户接口唯一对外使用的标识。数据库内部的自增主键不会通过 API 暴露。
 
@@ -97,7 +99,7 @@ HTTP 状态码仍保持标准语义，不统一强制返回 `200`；客户端应
 
 ## 相关模块
 
-登录、令牌刷新、登出与当前用户接口见 [认证模块 API 文档](./AUTH_API.md)。用户接口当前为匿名可访问；若需要限制访问，应在对应 Handler 中提取 `common::auth_extractor::CurrentUser`，认证要求即由类型声明体现。
+登录、令牌刷新、登出与当前用户接口见 [认证模块 API 文档](./AUTH_API.md)。用户接口需要登录：认证由挂在 `/api/v1` 路由组上的 `common::auth::require_login` 中间件统一强制，Handler 中声明 `common::auth_extractor::CurrentUser` 只用于表达「该接口需要身份」并在需要时读取当前用户。新增接口挂在 `/api/v1` 之下即自动受保护，无需额外声明。
 
 ## 维护方式
 
@@ -118,23 +120,30 @@ cargo test
 
 ## 命令行示例
 
+用户接口需要登录，因此先用 `-c` 保存登录后的 Cookie，再用 `-b` 携带：
+
 ```bash
+# 0. 登录并保存令牌 Cookie
+curl -c cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"adminuser","password":"password123"}'
+
 # 创建用户
-curl -X POST http://127.0.0.1:3000/api/v1/users \
+curl -b cookies.txt -X POST http://127.0.0.1:3000/api/v1/users \
   -H "Content-Type: application/json" \
   -d '{"username":"testuser","email":"test@example.com","password":"password123","nickname":"测试用户"}'
 
 # 获取用户列表
-curl "http://127.0.0.1:3000/api/v1/users?page=1&page_size=10"
+curl -b cookies.txt "http://127.0.0.1:3000/api/v1/users?page=1&page_size=10"
 
 # 获取用户详情
-curl http://127.0.0.1:3000/api/v1/users/01991f3a-7c40-7d62-8f6d-4fb743e0f731
+curl -b cookies.txt http://127.0.0.1:3000/api/v1/users/01991f3a-7c40-7d62-8f6d-4fb743e0f731
 
 # 更新用户
-curl -X PUT http://127.0.0.1:3000/api/v1/users/01991f3a-7c40-7d62-8f6d-4fb743e0f731 \
+curl -b cookies.txt -X PUT http://127.0.0.1:3000/api/v1/users/01991f3a-7c40-7d62-8f6d-4fb743e0f731 \
   -H "Content-Type: application/json" \
   -d '{"email":"newemail@example.com","nickname":"新昵称"}'
 
 # 删除用户
-curl -X DELETE http://127.0.0.1:3000/api/v1/users/01991f3a-7c40-7d62-8f6d-4fb743e0f731
+curl -b cookies.txt -X DELETE http://127.0.0.1:3000/api/v1/users/01991f3a-7c40-7d62-8f6d-4fb743e0f731
 ```
