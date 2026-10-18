@@ -10,7 +10,7 @@ max_connections = 10
 # Redis 配置：登录失败计数、access token 吊销列表与用户资料缓存。
 # 这些数据都可以重建，Redis 不可用时各功能会降级（登录限流回退数据库、
 # 吊销与缓存跳过），但 /ready 会把实例标记为未就绪，生产环境应保证其可用。
-# 本地启动：docker run --rm -p 6379:6379 redis:7-alpine
+# 本地启动：docker run --rm -p 6379:6379 redis:latest
 [redis]
 url = "redis://127.0.0.1:6379"
 # 连接池上限：Redis 一条多路复用连接即可承载并发，这里限制的是突发连接数。

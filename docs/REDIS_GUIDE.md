@@ -68,7 +68,7 @@ Windows 上没有官方 Redis 安装包，最省事的方式是 Docker：
 
 ```bash
 # 启动一个带密码的 Redis 7（密码请自行替换）
-docker run --name axum-redis -p 6379:6379 -d redis:7-alpine \
+docker run --name axum-redis -p 6379:6379 -d redislatest \
   redis-server --requirepass "dev-password"
 
 # 查看是否启动成功
@@ -81,7 +81,7 @@ docker exec -it axum-redis redis-cli -a dev-password
 如果使用项目默认配置（`redis://127.0.0.1:6379`、无密码），可以省掉 `--requirepass`：
 
 ```bash
-docker run --name axum-redis -p 6379:6379 -d redis:7-alpine
+docker run --name axum-redis -p 6379:6379 -d redis:latest
 docker exec -it axum-redis redis-cli
 ```
 
