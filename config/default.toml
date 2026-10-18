@@ -3,8 +3,22 @@ host = "0.0.0.0"
 port = 3000
 
 [database]
-url = "postgresql://localhost:5432/postgres"
+# url = "postgres://127.0.0.1:5432/postgres"
+url = "postgresql://postgres:postgres@localhost:5432/postgres"
 max_connections = 10
+
+# Redis 配置：登录失败计数、access token 吊销列表与用户资料缓存。
+# 这些数据都可以重建，Redis 不可用时各功能会降级（登录限流回退数据库、
+# 吊销与缓存跳过），但 /ready 会把实例标记为未就绪，生产环境应保证其可用。
+# 本地启动：docker run --rm -p 6379:6379 redis:7-alpine
+[redis]
+url = "redis://127.0.0.1:6379"
+# 连接池上限：Redis 一条多路复用连接即可承载并发，这里限制的是突发连接数。
+pool_size = 8
+# 键命名空间：多环境共用一个实例时必须区分，避免相互覆盖。
+key_prefix = "axum"
+# 用户详情缓存 TTL（秒）。写入路径会主动删缓存，这里只是最后一道兜底。
+user_cache_ttl_seconds = 60
 
 [log]
 level = "info"
@@ -33,4 +47,16 @@ refresh_name = "refresh_token"
 secure = false
 same_site = "strict"
 path = "/"
+
+# 引导账号配置：数据库还没有任何用户时创建首个可登录账号。
+# 存在的原因：/api/v1 下所有接口都要求登录，而创建用户的接口自身也在该路由组内，
+# 空库时「无法登录 → 无法建用户」形成死锁，全部业务接口只能返回 401。
+# 只有 users 表为空时才会执行，因此不会成为反复写库的建号通道。
+# 凭据属于敏感信息：本文件会提交到仓库，只保留空值，
+# 真实口令请写入 config/local.toml（已被 .gitignore 排除）或通过 APP__BOOTSTRAP__* 注入。
+[bootstrap]
+enabled = false
+username = ""
+email = ""
+password = ""
 

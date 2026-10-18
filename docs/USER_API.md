@@ -27,6 +27,17 @@ Swagger UI 支持查看 Schema、展开接口详情并直接发起调试请求�
 
 用户响应中的 `public_id` 是服务端生成的 UUIDv7，也是用户接口唯一对外使用的标识。数据库内部的自增主键不会通过 API 暴露。
 
+## 缓存与一致性（Redis）
+
+`GET /api/v1/users/{public_id}` 采用 Cache-Aside：先读 Redis（键为 `{redis.key_prefix}:user:detail:{public_id}`），未命中再查数据库并回填，存活时间由 `redis.user_cache_ttl_seconds` 控制（默认 60 秒）。
+
+对调用方可见的两个结果：
+
+- **更新（`PUT`）与删除（`DELETE`）成功后缓存立即被删除**，随后第一次查询必然读到最新数据。
+- 缓存只是加速层，Redis 不可用时接口仍然可用（直接回源数据库）；此时若删除缓存失败，最多出现一个 TTL 长度的陈旧窗口。
+
+列表接口刻意不缓存：分页结果与总数会被任意一次写入整体失效，命中率低而失效成本高。缓存结构、键设计与排障方法见 [Redis 学习与项目实战指南](./REDIS_GUIDE.md)。
+
 ## 请求参数校验
 
 - 创建用户：`username` 长度为 3–50，`email` 必须是合法邮箱且不超过 100，`password` 长度为 8–72，`nickname` 不超过 100。
@@ -109,6 +120,7 @@ HTTP 状态码仍保持标准语义，不统一强制返回 `200`；客户端应
 - Model 的 `ToSchema`：请求与响应 Schema。
 - 查询参数模型的 `IntoParams`：查询参数定义。
 - `src/app/openapi.rs`：统一注册新增的接口和 Schema。
+- `src/modules/user/service.rs`：缓存读写与写操作后的失效逻辑（调整缓存键或 TTL 时同步更新本文档与 `docs/REDIS_GUIDE.md`）。
 
 完成修改后运行：
 
@@ -120,13 +132,15 @@ cargo test
 
 ## 命令行示例
 
-用户接口需要登录，因此先用 `-c` 保存登录后的 Cookie，再用 `-b` 携带：
+用户接口需要登录，因此先用 `-c` 保存登录后的 Cookie，再用 `-b` 携带。**数据库为空时没有任何账号能登录**（创建用户接口自身也要求登录），需要先按 `docs/AUTH_API.md` 的「首次启动：第一个账号从哪里来」创建引导账号：
 
 ```bash
 # 0. 登录并保存令牌 Cookie
+#    用户名与口令取自引导账号配置（bootstrap.username / bootstrap.password），
+#    详见 docs/AUTH_API.md 的「首次启动」一节。
 curl -c cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"adminuser","password":"password123"}'
+  -d '{"username":"your-admin","password":"your-bootstrap-password"}'
 
 # 创建用户
 curl -b cookies.txt -X POST http://127.0.0.1:3000/api/v1/users \

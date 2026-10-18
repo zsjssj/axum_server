@@ -8,3 +8,12 @@ max_connections = 20
 
 [log]
 level = "warn"
+
+# 生产环境的 Redis。
+# 注意 key_prefix 必须与开发/测试不同：多个环境共用一个实例时，
+# 相同前缀会互相覆盖登录失败计数、吊销记录与缓存。
+[redis]
+url = "redis://redis_host:6379"
+pool_size = 16
+key_prefix = "axum-prod"
+user_cache_ttl_seconds = 60

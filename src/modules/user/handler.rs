@@ -90,6 +90,10 @@ pub(crate) async fn list_users(
 }
 
 /// 获取单个用户
+///
+/// 数据可能来自 Redis 缓存（命中时不查库），因此响应内容可能比刚写入的更新
+/// 晚至多 `redis.user_cache_ttl_seconds` 秒；写入路径会主动删除缓存，
+/// TTL 只是最后的兜底。缓存不可用时接口仍然可用，直接回源数据库。
 #[utoipa::path(
     get,
     path = "/api/v1/users/{public_id}",
@@ -108,7 +112,7 @@ pub(crate) async fn get_user(
     _current_user: CurrentUser,
     ApiPath(public_id): ApiPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    let user = UserService::get_user_by_public_id(&state.db, public_id).await?;
+    let user = UserService::get_user_by_public_id(&state.db, &state.redis, public_id).await?;
     Ok(Json(ApiResponse::success("查询成功", user)))
 }
 
@@ -135,7 +139,7 @@ pub(crate) async fn update_user(
     ApiPath(public_id): ApiPath<Uuid>,
     ValidatedJson(req): ValidatedJson<UpdateUserRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let user = UserService::update_user(&state.db, public_id, req).await?;
+    let user = UserService::update_user(&state.db, &state.redis, public_id, req).await?;
 
     Ok(Json(ApiResponse::success("用户更新成功", user)))
 }
@@ -159,7 +163,7 @@ pub(crate) async fn delete_user(
     _current_user: CurrentUser,
     ApiPath(public_id): ApiPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    UserService::delete_user(&state.db, public_id).await?;
+    UserService::delete_user(&state.db, &state.redis, public_id).await?;
 
     Ok(Json(ApiResponse::<()>::success_without_data(
         "用户删除成功",

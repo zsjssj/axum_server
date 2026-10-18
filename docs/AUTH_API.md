@@ -53,7 +53,7 @@
 | --- | --- | --- | --- |
 | `POST` | `/api/v1/auth/login` | 用户登录，令牌通过响应头下发 | 否 |
 | `POST` | `/api/v1/auth/refresh` | 用刷新令牌 Cookie 换取新令牌对 | 刷新 Cookie |
-| `POST` | `/api/v1/auth/logout` | 吊销会话并清除令牌 Cookie | 否 |
+| `POST` | `/api/v1/auth/logout` | 吊销会话、吊销当前 access token 并清除令牌 Cookie | 否 |
 | `GET` | `/api/v1/auth/me` | 获取当前登录用户资料 | access Cookie |
 
 刷新与登出接口**没有请求体**：令牌直接取自请求 Cookie。请求体中的多余字段会被拒绝。
@@ -75,12 +75,18 @@
 - 请求没有 `access_token` Cookie → `401`、`未登录或登录已过期`。
 - Cookie 存在但 JWT 过期 → `401`、`认证令牌已过期`，此时应调用 `/auth/refresh`。
 - 签名、签发者或 `typ` 声明不合法 → `401`、`认证令牌无效` / `认证令牌类型错误`。
+- 令牌已被登出吊销 → `401`、`认证令牌已失效，请重新登录`。
 
 未注册的 `/api/v1` 路径不受该中间件影响，直接返回 `404`（`40400`）：认证中间件只作用于已匹配到路由的请求，不存在的接口不必先要求登录。
 
 ### 登出必须清除两个 Cookie
 
 登出响应会同时下发两个 `Max-Age=0` 的清除 Cookie，且属性（`Path`、`HttpOnly`、`Secure`、`SameSite`）与下发时完全一致。浏览器按名称、域和路径匹配 Cookie，属性不一致会导致清除失败、令牌残留在客户端。
+
+服务端同时吊销两类凭据：
+
+- `refresh_token` 对应的会话立即失效，无法再续期；
+- 当前 `access_token` 的 `jti` 被写入 Redis 吊销列表，认证中间件随后拒绝它——**登出后 access token 立即失效**。
 
 登出是**幂等**操作：重复调用、Cookie 已缺失、甚至服务端吊销失败，都会返回成功并清除 Cookie。让客户端卡在"无法退出"的状态比一次吊销失败更糟。
 
@@ -109,19 +115,25 @@ Cookie 会自动随请求发送，因此必须防 CSRF。本方案采用三层�
 
 | 令牌 | 格式 | 服务端状态 | 用途 |
 | --- | --- | --- | --- |
-| access token | JWT（HS256） | 无状态，不落库 | 访问受保护接口 |
+| access token | JWT（HS256） | 无状态；登出后按 `jti` 写入 Redis 吊销列表 | 访问受保护接口 |
 | refresh token | 256 位随机值 | 只存 SHA-256 摘要 | 换取新的令牌对 |
 
-### 调用方必须知道的边界
+### 登出后的失效范围
 
-**登出只能立即失效 `refresh_token`，不会立即失效已签发的 `access_token`。**
+**登出会立即使 `access_token` 与 `refresh_token` 都不可用。**
 
-这是双令牌无状态方案的固有性质，不是实现缺陷。服务端不保存 access token 的任何状态，因此无法逐个吊销。实际效果是：
+- `refresh_token` 对应的会话在数据库中被标记为已吊销，无法再续期；
+- `access_token` 的 `jti` 被写入 Redis 吊销列表（TTL 等于令牌剩余有效期），认证中间件每次校验令牌时会用 `EXISTS` 查询该列表，命中即返回：
 
-- 登出后，`refresh_token` 立即不可用，攻击者无法再续期；
-- 已泄露的 `access_token` 最多再存活 15 分钟。
+```json
+{
+  "code": 40100,
+  "message": "认证令牌已失效，请重新登录",
+  "data": null
+}
+```
 
-对安全性要求更高的场景应缩短 `access_ttl_minutes`。
+这里有一个需要调用方理解的边界：吊销检查依赖 Redis。若 Redis 不可用，服务端会记录告警并按「未吊销」放行，此时行为退化为改动前——已签发的 access token 在自然过期前（默认 15 分钟）仍然有效。Redis 是「立即生效」的增强，不是认证正确性的前提。
 
 ## 令牌轮换与重放检测
 
@@ -144,10 +156,24 @@ Cookie 会自动随请求发送，因此必须防 CSRF。本方案采用三层�
 
 设计说明：
 
-- 失败记录存放在 `login_failures` 表，**不在 `users` 表上做账号锁定**。后者会让自动锁定变成针对特定账号的拒绝服务手段——攻击者只需故意输错密码即可锁死他人账号。
+- 计数存放在 Redis 的有序集合中（键为 `{key_prefix}:auth:login_failures:{username}`，成员是失败的唯一标识、分数是失败时间），读取时先删除窗口外的成员再统计，因此是真正的滚动窗口，而不是「窗口边界会整体清零」的固定窗口。计数键带 TTL，窗口内没有失败就会自动消失。
+- 数据库的 `login_failures` 表继续保存审计记录，**不在 `users` 表上做账号锁定**。后者会让自动锁定变成针对特定账号的拒绝服务手段——攻击者只需故意输错密码即可锁死他人账号。
+- Redis 不可用时，判定自动回退为统计 `login_failures` 表，限流不会静默失效；此时延迟会略有上升，日志中会出现「回退到数据库统计」的告警。
 - 判定顺序是**先检查限流、再校验密码**。Argon2 校验被刻意设计得很慢，若顺序颠倒，大量失败请求会持续占用阻塞线程池，使限流本身成为消耗服务端算力的攻击面。
-- 登录成功后清理窗口外的历史失败记录，避免表无限增长，也避免正常用户被陈旧记录累积锁死。
+- 成功登录会清理窗口外的历史审计记录，但**不清空窗口内的失败计数**：清空等于给攻击者一个「只要偶尔成功一次就能重置限额」的入口。
 - 用户名不存在与密码错误返回**完全一致**的响应，且用户名不存在时同样执行一次 Argon2 计算，避免通过响应耗时区分账号是否存在，形成用户名枚举通道。
+
+命中限流时的响应：
+
+```json
+{
+  "code": 42900,
+  "message": "登录失败次数过多，请稍后再试",
+  "data": null
+}
+```
+
+即使此时密码正确也会被拒绝，这是限流的设计语义；窗口过去后自动恢复。
 
 ## 统一响应格式
 
@@ -192,6 +218,39 @@ Set-Cookie: refresh_token=3f1a9c2e5b7d...; HttpOnly; SameSite=Strict; Path=/; Ma
 }
 ```
 
+## 首次启动：第一个账号从哪里来
+
+`/api/v1` 下的接口默认要求登录，而创建用户的 `POST /api/v1/users` 自身也在该路由组内，且没有匿名注册入口。因此**空数据库时不存在任何能通过登录的账号**，全部业务接口只会返回 `401`。服务为这个死锁提供了一条受配置约束的出口：启动期引导账号（`src/app/bootstrap.rs`）。
+
+生效条件（两个都满足才执行）：
+
+1. `bootstrap.enabled = true`；
+2. `users` 表为空。
+
+已有用户的库永远不会被写入，因此开关保持开启也不会成为反复建号的通道。执行成功时日志会打印一条 `warn`，提示尽快修改口令并关闭开关。引导账号的字段规则与 `POST /api/v1/users` 完全一致（用户名 3–50、合法邮箱、密码 8–72），密码同样以 Argon2 哈希入库。
+
+推荐做法是把凭据写进未被版本控制的 `config/local.toml`，或使用环境变量：
+
+```toml
+# config/local.toml（已被 .gitignore 排除）
+[bootstrap]
+enabled = true
+username = "your-admin"
+email = "admin@example.com"
+password = "在此填入强口令"
+```
+
+```bash
+# 或使用环境变量
+APP__BOOTSTRAP__ENABLED=true \
+APP__BOOTSTRAP__USERNAME=your-admin \
+APP__BOOTSTRAP__EMAIL=admin@example.com \
+APP__BOOTSTRAP__PASSWORD='在此填入强口令' \
+cargo run
+```
+
+账号创建成功后即可把 `enabled` 改回 `false`。修改 `config/local.toml` 需要重启服务才会生效，配置只在启动时读取一次。
+
 ## 命令行示例
 
 浏览器会自动管理 Cookie，命令行调试需要用 `-c` 写入、`-b` 读取 Cookie 文件。由于 `/api/v1` 下的接口默认需要登录，**先登录再调用其他接口**是必须的：
@@ -230,12 +289,25 @@ curl -b cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/logout
 | `auth.cookie.secure` | `APP__AUTH__COOKIE__SECURE` | `false` | 是否仅 HTTPS 传输 |
 | `auth.cookie.same_site` | `APP__AUTH__COOKIE__SAME_SITE` | `strict` | `strict` 或 `lax` |
 | `auth.cookie.path` | `APP__AUTH__COOKIE__PATH` | `/` | Cookie 作用路径 |
+| `redis.url` | `APP__REDIS__URL` | `redis://127.0.0.1:6379` | 登录失败计数与令牌吊销使用的 Redis 地址 |
+| `redis.pool_size` | `APP__REDIS__POOL_SIZE` | `8` | Redis 连接池上限 |
+| `redis.key_prefix` | `APP__REDIS__KEY_PREFIX` | `axum` | 键命名空间，多环境必须不同 |
+| `redis.user_cache_ttl_seconds` | `APP__REDIS__USER_CACHE_TTL_SECONDS` | `60` | 用户详情缓存 TTL（认证模块不直接使用） |
+| `bootstrap.enabled` | `APP__BOOTSTRAP__ENABLED` | `false` | 是否在 `users` 表为空时创建引导账号 |
+| `bootstrap.username` | `APP__BOOTSTRAP__USERNAME` | 空 | 引导账号用户名（3–50 字符） |
+| `bootstrap.email` | `APP__BOOTSTRAP__EMAIL` | 空 | 引导账号邮箱 |
+| `bootstrap.password` | `APP__BOOTSTRAP__PASSWORD` | 空 | 引导账号口令（8–72 字符，仅启动期使用） |
+| `bootstrap.nickname` | `APP__BOOTSTRAP__NICKNAME` | 空 | 引导账号昵称，可选 |
 
 ### 生产环境必须做的三件事
 
 1. **替换 `APP__JWT__SECRET`**。配置文件中的值是公开的占位值，使用它等于任何人都能伪造任意用户的令牌。启动时会拒绝长度不足 32 个字符的密钥，但长度校验无法识别「已泄露的长密钥」。可用 `openssl rand -base64 48` 生成。
 2. **设置 `APP__AUTH__COOKIE__SECURE=true`**。默认值 `false` 仅为本地 HTTP 调试，若不改则令牌会在明文 HTTP 中传输。
 3. **多实例部署时保证 `jwt.secret` 一致**，否则令牌会在实例间随机失效。
+
+此外，**生产环境应保证 Redis 可用，并为每个环境设置不同的 `redis.key_prefix`**：不启动 Redis 时服务仍能运行，但限流会回退数据库、登出吊销与缓存失效，`/ready` 会返回 `503`；不同环境共用同一个前缀则会互相覆盖登录失败计数与吊销记录。
+
+另外，**引导账号创建完成后应关闭 `bootstrap.enabled` 并从部署环境移除其凭据**。该账号拥有与其他用户完全相同的权限，且口令是人工设定的，长期留存会让它成为比正常账号更容易被猜中的入口。
 
 ## 安全设计要点
 
@@ -247,6 +319,8 @@ curl -b cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/logout
 - **刷新令牌只存 SHA-256 摘要**。数据库泄露时摘要无法反推出可用的原始令牌。
 - **两个 Cookie 的 `Max-Age` 分别匹配各自令牌的有效期**，避免 access token 过期后仍被浏览器持续发送。
 - **JWT 错误信息区分「过期」与「无效」**，便于客户端决定是刷新还是重新登录，但两者都不泄露签名或密钥细节。
+- **登出立即吊销 access token**：只把 `jti` 写入 Redis，TTL 等于令牌剩余有效期，不保存令牌内容；Redis 泄露也无法据此伪造令牌，令牌自然过期后记录自动消失。
+- **限流状态放在 Redis，审计留在数据库**：既获得自动过期与多实例共享，又保留可追溯的失败记录；Redis 故障时判定自动回退数据库，不会出现「限流静默失效」。
 
 ## 维护方式
 
@@ -255,9 +329,13 @@ curl -b cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/logout
 - `modules/auth/handler.rs`：路由、Cookie 下发与 `utoipa::path` 注解。
 - `modules/auth/model.rs`：请求与响应 Schema。
 - `common/cookie.rs`：Cookie 的构建、解析与安全属性。
-- `common/auth.rs`：登录校验中间件与匿名白名单。调整 `/api/v1` 下的路由或认证入口时必须同步检查这里。
+- `common/auth.rs`：登录校验中间件、令牌吊销检查与匿名白名单。调整 `/api/v1` 下的路由或认证入口时必须同步检查这里。
+- `modules/auth/service.rs`：限流窗口、失败记录与 access token 吊销逻辑。
+- `infrastructure/redis.rs`：Redis 键命名、限流脚本与吊销读写。
 - `app/routes.rs`：`/api/v1` 路由组与认证中间件的挂载。
 - `app/openapi.rs`：统一注册接口与 Schema。
+
+Redis 的数据结构、命令与排错方式见 [Redis 学习与项目实战指南](./REDIS_GUIDE.md)。
 
 完成修改后运行：
 

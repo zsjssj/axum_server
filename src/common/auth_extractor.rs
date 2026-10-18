@@ -53,6 +53,7 @@ mod tests {
             db: sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy("postgres://user:password@localhost/test")
                 .expect("测试数据库连接字符串应合法"),
+            redis: crate::infrastructure::redis::RedisStore::without_connection(),
             jwt: Arc::new(JwtConfig {
                 secret: "unit-test-secret-with-enough-length-32".to_owned(),
                 issuer: "rust-axum-server-test".to_owned(),

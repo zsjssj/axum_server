@@ -65,7 +65,7 @@ pub async fn require_login(State(state): State<AppState>, request: Request, next
         return Ok(next.run(request).await);
     }
 
-    let user = authenticate(&state, request.headers())?;
+    let user = authenticate(&state, request.headers()).await?;
 
     // 拆分请求后重新组装，唯一目的是在扩展中写入身份再交给后续处理链。
     let (mut parts, body) = request.into_parts();
@@ -90,12 +90,29 @@ fn is_public_path(path: &str) -> bool {
 ///
 /// 令牌只从 Cookie 读取：`Authorization` 头不被解析，避免出现绕过 Cookie
 /// 安全属性（`HttpOnly`、`SameSite`）的旁路认证方式。
-fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Result<AuthUser, AppError> {
+///
+/// 签名校验通过后还要查询 Redis 吊销列表：登出会把 access token 的 `jti`
+/// 写入该列表，使令牌不必等到自然过期才失效。查询失败时按「未吊销」放行并
+/// 记录告警——吊销是「登出立即生效」的增强，而不是令牌有效性的前提；
+/// Redis 故障时退化为改动前的行为（令牌到期才失效），比把全部已登录用户
+/// 一次性踢下线更合理。
+async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Result<AuthUser, AppError> {
     let token = cookie::access_token_from_headers(headers, &state.auth.cookie).ok_or(AppError::Unauthorized("未登录或登录已过期"))?;
 
-    let user_id = AuthService::verify_access_token(&state.jwt, &token)?;
+    let verified = AuthService::verify_access_token(&state.jwt, &token)?;
 
-    Ok(AuthUser { user_id })
+    match state.redis.is_access_token_revoked(&verified.jti).await {
+        Ok(true) => {
+            tracing::debug!(jti = %verified.jti, "access token 已在吊销列表中");
+            return Err(AppError::Unauthorized("认证令牌已失效，请重新登录"));
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "查询令牌吊销列表失败，按未吊销处理"),
+    }
+
+    Ok(AuthUser {
+        user_id: verified.user_id,
+    })
 }
 
 #[cfg(test)]
@@ -158,6 +175,10 @@ mod tests {
                 db: sqlx::postgres::PgPoolOptions::new()
                     .connect_lazy("postgres://user:password@localhost/test")
                     .expect("测试数据库连接字符串应合法"),
+                // 不建立连接的实例：用例只验证令牌校验与身份传递。
+                // Redis 不可达时吊销检查走「按未吊销处理」的降级分支，
+                // 因此这里同时也覆盖了 Redis 故障时的认证行为。
+                redis: crate::infrastructure::redis::RedisStore::without_connection(),
                 jwt: Arc::new(JwtConfig {
                     secret: "unit-test-secret-with-enough-length-32".to_owned(),
                     issuer: "rust-axum-server-test".to_owned(),

@@ -5,16 +5,21 @@ use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
 /// 用户实体
-#[derive(Debug, Serialize, FromRow, ToSchema)]
+///
+/// 同时派生 `Serialize` 与 `Deserialize`：除了作为响应模型，它还是 Redis
+/// 中用户资料缓存的序列化格式。两端使用同一类型可以避免「缓存结构体」与
+/// 响应模型各自演进、最终返回字段不一致的问题；两个时间字段的序列化格式
+/// 也因此被固定为同一种（见 [`serialize_datetime`] 与 [`deserialize_datetime`]）。
+#[derive(Debug, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct User {
     pub public_id: Uuid,
     pub username: String,
     pub email: String,
     pub nickname: Option<String>,
-    #[serde(serialize_with = "serialize_datetime")]
+    #[serde(serialize_with = "serialize_datetime", deserialize_with = "deserialize_datetime")]
     #[schema(value_type = String)]
     pub created_at: chrono::NaiveDateTime,
-    #[serde(serialize_with = "serialize_datetime")]
+    #[serde(serialize_with = "serialize_datetime", deserialize_with = "deserialize_datetime")]
     #[schema(value_type = String)]
     pub updated_at: chrono::NaiveDateTime,
 }
@@ -82,6 +87,20 @@ where
     serializer.serialize_str(&value.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
+/// 按与 [`serialize_datetime`] 完全相同的格式解析时间。
+///
+/// 缓存读取必须使用对应的解析规则：JSON 中日期是字符串，默认的
+/// `chrono` 反序列化期待 RFC3339，格式不一致会让缓存命中直接变成反序列化错误。
+fn deserialize_datetime<'de, D>(deserializer: D) -> Result<chrono::NaiveDateTime, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+
+    chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S")
+        .map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +129,31 @@ mod tests {
         let errors = request.validate().expect_err("空更新请求应校验失败");
 
         assert!(errors.field_errors().contains_key("__all__"));
+    }
+
+    /// 缓存与响应共用同一个 `User` 结构，序列化结果必须能被反序列化回来。
+    /// 两个时间字段的格式一旦不一致，缓存命中会直接变成 500，
+    /// 而走数据库的路径却完全正常——这类问题只在有缓存时暴露，必须由测试锁定。
+    #[test]
+    fn user_round_trips_through_cache_json() {
+        let timestamp = chrono::NaiveDateTime::parse_from_str("2024-05-06 07:08:09", "%Y-%m-%d %H:%M:%S")
+            .expect("测试时间应合法");
+        let user = User {
+            public_id: Uuid::now_v7(),
+            username: "cache-user".to_owned(),
+            email: "cache@example.com".to_owned(),
+            nickname: Some("缓存用户".to_owned()),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+
+        let json = serde_json::to_string(&user).expect("用户应可序列化为缓存值");
+        let restored: User = serde_json::from_str(&json).expect("缓存值应可反序列化回用户");
+
+        assert_eq!(restored.public_id, user.public_id);
+        assert_eq!(restored.username, user.username);
+        assert_eq!(restored.nickname, user.nickname);
+        assert_eq!(restored.created_at, timestamp);
+        assert_eq!(restored.updated_at, timestamp);
     }
 }

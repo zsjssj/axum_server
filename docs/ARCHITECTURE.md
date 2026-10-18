@@ -9,6 +9,7 @@
 - Axum：HTTP 路由、请求提取和响应转换。
 - Tokio：异步运行时及阻塞任务调度。
 - SQLx：PostgreSQL 连接池与数据访问。
+- Redis + bb8：登录失败计数、access token 吊销列表与用户资料缓存（见 [Redis 学习与项目实战指南](./REDIS_GUIDE.md)）。
 - Serde：请求、响应和配置的序列化与反序列化。
 - Validator：请求模型和查询参数的声明式校验。
 - config + dotenv：分环境配置加载。
@@ -22,13 +23,13 @@
 ```text
 rust-axum-server/
 ├── config/                 # 默认配置和分环境配置
-├── docs/                   # 架构与接口文档
+├── docs/                   # 架构与接口文档（含 Redis 学习指南）
 ├── migrations/             # 数据库迁移脚本
 └── src/
-    ├── app/                # 应用装配、全局状态、路由和中间件
+    ├── app/                # 应用装配、全局状态、路由、中间件和启动期初始化（含引导账号）
     ├── common/             # 跨业务模块复用的能力：错误边界、分页、Cookie、登录校验等
     ├── config/             # 配置结构定义与加载逻辑
-    ├── infrastructure/     # 数据库等外部基础设施适配
+    ├── infrastructure/     # 外部依赖适配：PostgreSQL 连接池与 Redis 访问器
     ├── modules/            # 业务模块
     │   ├── auth/           # 认证模块：登录、令牌刷新、登出、当前用户
     │   └── user/           # 用户模块
@@ -39,14 +40,14 @@ rust-axum-server/
 
 | 层级 | 主要职责 | 不应承担的职责 |
 | --- | --- | --- |
-| `main` | 串联配置、日志、数据库、应用和监听器的初始化 | 具体业务处理 |
+| `main` | 串联配置、日志、数据库、Redis、应用和监听器的初始化 | 具体业务处理 |
 | `app` | 组装路由、中间件和共享状态 | 业务规则和 SQL |
 | `handler` | 提取 HTTP 参数、调用服务、组装 HTTP 响应 | 直接编写 SQL 或承载复杂业务规则 |
 | `service` | 执行业务规则、协调数据访问、转换业务错误 | 处理路由细节 |
 | `repository` | 执行 SQL、完成数据库实体读写 | 决定 HTTP 状态码或业务流程 |
 | `model` | 定义数据库实体、请求模型及序列化规则 | 执行业务操作 |
 | `common` | 提供可跨模块复用的通用能力 | 放置仅属于单个模块的逻辑 |
-| `infrastructure` | 初始化和封装数据库等外部依赖 | 承载领域业务规则 |
+| `infrastructure` | 初始化和封装数据库、Redis 等外部依赖 | 承载领域业务规则，或替调用方决定降级策略 |
 
 依赖方向应保持为：
 
@@ -57,7 +58,7 @@ Router / Middleware
    ↓
 Handler
    ↓
-Service
+Service ──→ infrastructure（Redis 适配层）
    ↓
 Repository
    ↓
@@ -65,6 +66,8 @@ PostgreSQL
 ```
 
 上层可以调用下层，下层不应反向依赖上层。例如，Repository 不应依赖 Handler，Service 不应返回 Axum 的 HTTP 响应类型。
+
+Redis 适配层（`infrastructure::redis`）与 Repository 处于同一层：Service 直接调用它完成「临时状态」读写，而权威数据仍然只经由 Repository 进入 PostgreSQL。适配层只负责如实返回错误，**不替调用方决定降级策略**——某个功能在 Redis 故障时是回退数据库还是跳过，由 Service 按自己的安全语义决定。
 
 ## 3. 应用启动流程
 
@@ -76,10 +79,12 @@ PostgreSQL
 4. 根据日志级别初始化 `tracing` 订阅器。
 5. 根据数据库配置创建 PostgreSQL 连接池。
 6. SQLx 执行编译进程序的 `migrations` 迁移；迁移失败时终止启动，避免服务在数据库结构不完整时接收流量。
-7. `create_app` 创建 `AppState`（连接池与认证配置），组装健康检查路由、API 路由和中间件。
-8. 根据主机与端口配置绑定 TCP 监听器。
-9. Axum 通过 `into_make_service_with_connect_info` 接管监听器并开始处理请求。使用带连接信息的服务是因为登录与刷新接口需要记录客户端 IP 用于安全审计。
-10. 任一启动步骤失败时，错误返回到 `main`，程序输出错误并以非零状态退出。
+7. `app::bootstrap::ensure_bootstrap_user` 在开关开启且 `users` 表为空时创建引导账号。该步骤必须在开始监听之前完成：`/api/v1` 下的接口默认要求登录，而创建用户的接口自身也在该路由组内，空库时「要登录得先有用户、要建用户得先登录」无法自解，服务虽然能启动但全部业务接口只会返回 `401`。
+8. `RedisStore::from_config` 创建 Redis 访问器（连接池 + 键命名空间），并执行一次 `PING` 探测。创建失败（地址非法）终止启动；**只是连不上时不终止**，仅记录告警并继续——各功能都有降级路径，`/ready` 会把实例标记为未就绪，由编排系统决定是否接流量。这一取舍的完整说明见 [Redis 学习与项目实战指南](./REDIS_GUIDE.md) 第 6.4 节。
+9. `create_app` 创建 `AppState`（数据库连接池、Redis 访问器与认证配置），组装健康检查路由、API 路由和中间件。
+10. 根据主机与端口配置绑定 TCP 监听器。
+11. Axum 通过 `into_make_service_with_connect_info` 接管监听器并开始处理请求。使用带连接信息的服务是因为登录与刷新接口需要记录客户端 IP 用于安全审计。
+12. 任一启动步骤失败时，错误返回到 `main`，程序输出错误并以非零状态退出。
 
 ```text
 main
@@ -89,10 +94,24 @@ main
       ├─ 初始化日志
       ├─ 创建数据库连接池
       ├─ 执行数据库迁移
+      ├─ 创建引导账号（仅在开关开启且 users 表为空时）
+      ├─ 创建 Redis 访问器并探测（失败仅告警）
       ├─ 组装 Axum Router 与 AppState
       ├─ 绑定 TCP 地址
       └─ 启动 HTTP 服务（携带连接信息）
 ```
+
+> 启动顺序上的一个约束：`RedisStore::from_config` 会创建 bb8 连接池并启动其后台回收任务，必须在 Tokio 运行时内调用（`main` 的 `run` 满足这一点，单元测试需要用 `#[tokio::test]`）。
+
+### 引导账号的边界
+
+引导账号是启动期的一次性出口，而不是默认账号。三个约束共同保证它不会变成长期后门：
+
+- **默认关闭**：`bootstrap.enabled` 在 `config/default.toml` 中为 `false`，必须显式开启。
+- **只在 `users` 表为空时执行**：判据是表为空而不是「该用户名不存在」，已有用户的库永远不会被写入，因此开关长期开启也不会成为反复建号的通道。
+- **规则不另开一套**：账号字段校验复用 `CreateUserRequest`，密码哈希复用 `common::password`，唯一键冲突按「已由其他实例创建」处理，避免引导路径与正常路径在约束上分叉。
+
+口令属于凭据，只能通过 `config/local.toml`（已被 `.gitignore` 排除）或 `APP__BOOTSTRAP__*` 环境变量注入，不能写入 `config/default.toml` 这类会提交的文件。
 
 ## 4. 配置加载流程
 
@@ -153,8 +172,9 @@ non-UTF-8 string for its error message.
 
 1. 请求先经过 CORS 与日志中间件。
 2. 请求进入 `/api/v1` 路由组后先经过认证中间件。中间件从 `access_token` Cookie 读取 JWT，校验签名、签发者、有效期与 `typ` 声明，并把任何失败转换为统一的 `AppError::Unauthorized`（`401`，业务码 `40100`）。
-3. 校验通过后，中间件把用户身份写入请求扩展；Handler 再提取 `State`、`CurrentUser` 与业务参数，后续流程与匿名接口一致。
-4. `CurrentUser` 提取器只从请求扩展读取身份，不再次解析 Cookie。Handler 签名中出现 `CurrentUser` 表示该接口需要登录，身份来源由中间件保证。
+3. 校验通过后，中间件用令牌的 `jti` 查询 Redis 吊销列表（`EXISTS`）：登出会把 `jti` 写入该列表，命中时返回 `401`「认证令牌已失效，请重新登录」。查询失败时记录告警并放行，退化为「令牌到期才失效」，避免 Redis 抖动把全部已登录用户踢下线。
+4. 中间件把用户身份写入请求扩展；Handler 再提取 `State`、`CurrentUser` 与业务参数，后续流程与匿名接口一致。
+5. `CurrentUser` 提取器只从请求扩展读取身份，不再次解析 Cookie。Handler 签名中出现 `CurrentUser` 表示该接口需要登录，身份来源由中间件保证。
 
 选择「中间件默认拒绝 + 显式白名单」而不是逐个 Handler 声明认证，原因是失效方向：漏写一处认证只会被评审发现，而默认拒绝会让任何新增接口天然受保护。白名单只有三项，且与路由注册共用同一组常量（`common::auth` 的 `LOGIN_PATH`、`REFRESH_PATH`、`LOGOUT_PATH`）：
 
@@ -181,7 +201,7 @@ non-UTF-8 string for its error message.
 
 | 令牌 | 格式 | 有效期 | 服务端状态 |
 | --- | --- | --- | --- |
-| access token | JWT（HS256） | 15 分钟 | 无状态，不落库 |
+| access token | JWT（HS256） | 15 分钟 | 无状态；登出后按 `jti` 写入 Redis 吊销列表 |
 | refresh token | 256 位随机值 | 7 天 | 只存 SHA-256 摘要 |
 
 Cookie 固定启用 `HttpOnly`，`Secure` 与 `SameSite` 由 `auth.cookie` 配置控制。`HttpOnly` 使页面脚本无法读取令牌，把 XSS 的影响限制为"代为发请求"，而无法长期窃取凭据。两个 Cookie 的 `Max-Age` 分别匹配各自令牌的有效期。
@@ -196,16 +216,38 @@ Cookie 固定启用 `HttpOnly`，`Secure` 与 `SameSite` 由 `auth.cookie` 配�
 
 ### 登出语义的边界
 
-access token 无状态，服务端无法逐个吊销。因此**登出只能立即失效 refresh token**，已签发的 access token 最多再存活 15 分钟。这是双令牌方案的固有性质，不是实现缺陷，对安全性要求更高的场景应缩短 `access_ttl_minutes`。
+登出会同时处理两类凭据：
+
+- **refresh token**：会话落库，登出即吊销记录（`revoked_at`），之后无法再续期；
+- **access token**：本身无状态，登出时把令牌的 `jti` 写入 Redis 吊销列表（`SET ... EX`，TTL 等于令牌剩余有效期），认证中间件随后用 `EXISTS` 拦截已吊销的令牌。因此**登出后 access token 立即失效**，不必再等 15 分钟。
+
+吊销检查依赖 Redis，失败时按「未吊销」放行并告警：此时退化为「令牌到期才失效」，与引入 Redis 之前的行为一致。这是「登出立即生效」的增强，而不是认证正确性的前提。
+
+access token 自然过期后，对应的吊销记录也会随 TTL 消失，不会无限累积。
 
 ### 登录保护
 
-登录失败按用户名与滑动时间窗口统计，超过阈值后返回 `429`。两个关键顺序约束：
+登录失败按用户名与滑动时间窗口统计，超过阈值后返回 `429`。判定依据存放在 Redis 的有序集合中（`{key_prefix}:auth:login_failures:{username}`），成员是一次失败的唯一标识、分数是失败时间：
 
-- 失败记录独立存放于 `login_failures` 表，不在 `users` 表上做账号锁定，避免自动锁定被用作针对特定账号的拒绝服务手段。
+- 读取时先用 `ZREMRANGEBYSCORE` 删除窗口外的成员，`ZCARD` 得到窗口内次数；「修剪 + 统计」和「修剪 + 写入 + 续期」分别在 Lua 脚本中原子完成。
+- 选择有序集合而不是 `INCR` + `EXPIRE`：后者是固定窗口，窗口边界处整体清零，攻击者可以借此把允许次数翻倍。
+- 键带 TTL，连续一个窗口没有失败就自动消失，不需要清理任务。
+- **数据库仍保留审计记录**（`login_failures` 表）：Redis 是判定用的加速层，数据库是权威审计来源；Redis 不可用时回退为直接统计该表，限流不会整体失效。
+
+两个关键顺序约束：
+
+- 失败记录独立存放，不在 `users` 表上做账号锁定，避免自动锁定被用作针对特定账号的拒绝服务手段。
 - **先判定限流，再校验密码**。Argon2 校验被刻意设计得很慢，顺序颠倒会让大量失败请求持续占用阻塞线程池，使限流本身成为消耗算力的攻击面。
 
+成功登录只清理数据库中的窗口外审计记录，不清空 Redis 中的窗口内计数：清空等于给攻击者一个「只要偶尔成功一次就能重置限额」的入口。
+
 此外，用户名不存在时同样执行一次 Argon2 计算，使用户名枚举无法通过响应耗时区分账号是否存在。
+
+### 用户资料缓存
+
+`GET /api/v1/users/{public_id}` 采用 Cache-Aside：先读 Redis（`{key_prefix}:user:detail:{public_id}`），未命中再查库并回填，TTL 由 `redis.user_cache_ttl_seconds` 控制。更新与删除在写库成功后**删除**缓存（而不是更新），避免并发写入把旧值留到 TTL 到期。
+
+缓存不可用时直接回源数据库；回填或删除失败只告警。缓存是加速层，不是接口正确性的前提。缓存穿透、击穿、雪崩的处理与取舍见 [Redis 学习与项目实战指南](./REDIS_GUIDE.md) 第 6.3 节。
 
 ### CSRF 防护
 
@@ -213,7 +255,9 @@ Cookie 会自动随请求发送，因此必须防 CSRF。主要防线是 `SameSi
 
 ## 7. 全局状态与中间件
 
-`AppState` 保存可以安全共享的应用级依赖：`PgPool`、`Arc<JwtConfig>` 与 `Arc<AuthConfig>`。Axum 会克隆 State，但 `PgPool` 内部使用共享句柄、配置项使用 `Arc`，因此不会为每次请求复制连接池或配置内容。认证配置随状态共享，使认证中间件可以在校验令牌时直接访问 JWT 密钥，而不必让每个受保护的 Handler 多一个依赖参数。
+`AppState` 保存可以安全共享的应用级依赖：`PgPool`、`RedisStore`、`Arc<JwtConfig>` 与 `Arc<AuthConfig>`。Axum 会克隆 State，但 `PgPool` 与 `RedisStore` 内部都是共享句柄、配置项使用 `Arc`，因此不会为每次请求复制连接池或配置内容。认证配置随状态共享，使认证中间件可以在校验令牌时直接访问 JWT 密钥，而不必让每个受保护的 Handler 多一个依赖参数。
+
+`RedisStore` 同时承载连接池、键命名空间与缓存 TTL 配置，克隆成本与 `Arc` 相同。它不保存任何无法从数据库重建的数据，因此可以随实例生命周期存在，不需要持久化。
 
 当前中间件包括：
 
@@ -250,12 +294,17 @@ Cookie 会自动随请求发送，因此必须防 CSRF。主要防线是 `SameSi
 ## 9. 数据与安全设计
 
 - 密码仅以 Argon2 哈希形式写入数据库，API 响应和查询字段均不包含 `password_hash`。认证查询通过独立的 `UserCredentials` 类型返回凭证，该类型不派生 `Serialize` 与 `ToSchema`；把 `password_hash` 挂到公开的 `User` 上会使其顺着响应序列化和 OpenAPI Schema 一起对外暴露，类型分离是这里唯一可靠的防线。
+- 引导账号只在 `users` 表为空且配置开关开启时创建，用于解开「登录需要用户、建用户需要登录」的死锁。它不是默认口令：开关默认关闭、只对空表生效、执行后即可关闭，且凭据只能来自未提交的本地配置或环境变量。
 - 令牌通过 `HttpOnly` Cookie 下发，响应体不携带令牌；access token 与 refresh token 使用不同有效期，Cookie 的 `Max-Age` 分别匹配。
 - refresh token 只保存 SHA-256 摘要，数据库泄露时无法反推出可用令牌；因其本身是 256 位随机值，不存在字典攻击空间，无需使用慢速哈希。
+- access token 的吊销记录存放在 Redis，TTL 等于令牌剩余有效期：只保存 `jti`，不保存令牌本身，Redis 泄露也无法据此伪造令牌。
+- 登录失败计数存放在 Redis 有序集合中（滑动窗口），数据库 `login_failures` 表只承担审计职责；Redis 不可用时判定自动回退到该表，不会出现「限流静默失效」。
+- Redis 只保存可以重建的数据：登录失败计数、短期吊销记录、用户资料缓存。任何无法从数据库重建的数据都不应进入 Redis。
 - 用户采用内部 `BIGINT IDENTITY` 主键与公开 UUIDv7 双 ID。内部主键用于数据库关联和排序，不通过 API 暴露；UUIDv7 由 Service 在创建用户时生成，作为接口路径、响应和跨系统传递使用的稳定标识。认证令牌的 `sub` 使用内部主键，使受保护接口可直接命中主键索引。
 - 所有 SQL 使用 SQLx 参数绑定，不拼接用户输入。IP 地址以文本绑定并由 `$n::inet` 交给 PostgreSQL 校验格式。
-- 数据库连接通过连接池复用，并设置连接获取超时。
-- 健康检查 `/health` 只表示进程可响应；就绪检查 `/ready` 会执行数据库探测，用于判断服务是否具备接收业务流量的条件。
+- 数据库连接通过连接池复用，并设置连接获取超时；Redis 连接同样通过连接池复用，取连接带超时，并在检出前 `PING` 剔除失效连接。
+- 健康检查 `/health` 只表示进程可响应；就绪检查 `/ready` 会探测数据库与 Redis，两者任一不可用即返回 `503`，避免「降级运行」的实例继续接收流量。
+- Redis 键统一带 `redis.key_prefix` 命名空间（如 `axum:auth:login_failures:<username>`），多环境共用一个实例时互不干扰；配置校验拒绝空前缀。
 - 数据库结构通过 `migrations` 目录中的脚本维护；迁移脚本会在编译时嵌入程序，并在服务启动、开始监听端口前自动执行。
 - 已发布或可能已执行的结构变更应新增迁移文件，不直接修改历史迁移；任何迁移失败都会中止服务启动。认证相关表通过 `002_create_auth_tables.sql` 新增，未改动 `001`。
 
@@ -296,6 +345,7 @@ src/modules/{module}/
 - 统一横切能力：错误、分页、配置、日志和共享状态集中管理，避免每个模块重复实现。
 - 异步路径避免阻塞：数据库和网络操作使用异步接口；CPU 密集或阻塞操作使用专用阻塞线程池。
 - 默认保护敏感信息：内部错误记录到日志，对外只返回稳定且必要的信息。
+- 外部依赖分级：数据库是权威依赖，不可用时启动失败、就绪检查失败；Redis 是加速依赖，不可用时各功能按明确策略降级，就绪检查同样失败。降级策略必须写在文档与代码注释里，不能靠运行时猜测。
 - 文档随实现更新：路由、模块边界、配置优先级或关键设计发生变化时，应同步更新本文件和对应 API 文档。
 
 ## 12. 注释语言约束
@@ -321,4 +371,4 @@ src/modules/{module}/
 
 认证采用 Cookie 方案，因此**不注册 `bearer_auth` 安全方案**：残留的 Bearer 方案会让调用方误以为存在 `Authorization` 头这条认证路径。同理也不注册 `apiKey` 形式的 Cookie 安全方案——OpenAPI 的 `apiKey` 只能声明「安全方案」，无法表达 HttpOnly、SameSite 等实际生效的约束，不如在接口描述与文档中说明。
 
-服务启动后可通过 `/swagger-ui/` 浏览交互式文档，通过 `/api-docs/openapi.json` 获取 OpenAPI JSON。**经 Swagger UI 调试受保护接口前，需要先调用登录接口**，浏览器会把返回的 Cookie 自动带上（Swagger UI 的请求与页面同源，因此能携带 Cookie）。新增或调整接口时，必须同步调整代码注解；手写 Markdown 只保留使用说明，不再重复维护完整的接口结构。各模块文档见 `docs/USER_API.md` 与 `docs/AUTH_API.md`。
+服务启动后可通过 `/swagger-ui/` 浏览交互式文档，通过 `/api-docs/openapi.json` 获取 OpenAPI JSON。**经 Swagger UI 调试受保护接口前，需要先调用登录接口**，浏览器会把返回的 Cookie 自动带上（Swagger UI 的请求与页面同源，因此能携带 Cookie）。新增或调整接口时，必须同步调整代码注解；手写 Markdown 只保留使用说明，不再重复维护完整的接口结构。各模块文档见 `docs/USER_API.md` 与 `docs/AUTH_API.md`；Redis 的概念、实战与排错见 `docs/REDIS_GUIDE.md`。

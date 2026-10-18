@@ -92,33 +92,46 @@ pub(crate) async fn health_handler() -> impl IntoResponse {
 pub struct ReadinessResponse {
     status: &'static str,
     database: &'static str,
+    redis: &'static str,
     timestamp: String,
 }
-/// 就绪检查处理器（包含数据库检查）
+/// 就绪检查处理器（包含数据库与 Redis 检查）
+///
+/// 与 `/health` 的分工：`/health` 只说明进程还能响应；本接口说明依赖是否齐备。
+/// Redis 不可用时返回 `503`，即使各功能都有降级路径——降级运行意味着实例
+/// 无法提供完整的登录保护，编排系统应把它移出流量池，而不是继续接收请求。
 #[utoipa::path(
     get,
     path = "/ready",
     tag = "系统",
     responses(
-        (status = 200, description = "服务与数据库均已就绪", body = ApiResponse<ReadinessResponse>),
-        (status = 503, description = "数据库不可用", body = ApiResponse<ErrorData>)
+        (status = 200, description = "服务、数据库与 Redis 均已就绪", body = ApiResponse<ReadinessResponse>),
+        (status = 503, description = "数据库或 Redis 不可用", body = ApiResponse<ErrorData>)
     )
 )]
 pub(crate) async fn readiness_handler(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     match sqlx::query("SELECT 1").execute(&state.db).await {
-        Ok(_) => Ok(Json(ApiResponse::success(
-            "请求成功",
-            ReadinessResponse {
-                status: "ready",
-                database: "connected",
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            },
-        ))),
+        Ok(_) => {}
         Err(error) => {
             tracing::warn!(%error, "数据库就绪检查失败");
-            Err(AppError::ServiceUnavailable("数据库不可用"))
+            return Err(AppError::ServiceUnavailable("数据库不可用"));
         }
     }
+
+    if let Err(error) = state.redis.ping().await {
+        tracing::warn!(%error, "Redis 就绪检查失败");
+        return Err(AppError::ServiceUnavailable("Redis 不可用"));
+    }
+
+    Ok(Json(ApiResponse::success(
+        "请求成功",
+        ReadinessResponse {
+            status: "ready",
+            database: "connected",
+            redis: "connected",
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+    )))
 }
 
 #[derive(Debug, Serialize, ToSchema)]

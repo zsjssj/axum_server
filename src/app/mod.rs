@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod middleware;
 pub mod openapi;
 pub mod routes;
@@ -6,6 +7,7 @@ pub mod state;
 use crate::app::middleware::{cors_layer, logging_middleware};
 use crate::app::state::AppState;
 use crate::config::AppConfig;
+use crate::infrastructure::redis::RedisStore;
 use axum::Router;
 use sqlx::PgPool;
 
@@ -13,8 +15,12 @@ use sqlx::PgPool;
 ///
 /// 直接接收 [`AppConfig`] 而不是拆散的配置项：后续新增需要共享的配置
 /// 时无需再修改该函数签名和所有调用点。
-pub fn create_app(db_pool: PgPool, config: &AppConfig) -> Router {
-    let state = AppState::new(db_pool, config.jwt.clone(), config.auth.clone());
+///
+/// [`RedisStore`] 由调用方创建后传入而不是在这里根据配置构造：
+/// 创建过程可能失败（连接地址非法），把失败点放在启动流程里，
+/// 才能给出「哪个组件初始化失败」的明确错误，而不是在 `create_app` 中 panic。
+pub fn create_app(db_pool: PgPool, redis: RedisStore, config: &AppConfig) -> Router {
+    let state = AppState::new(db_pool, redis, config.jwt.clone(), config.auth.clone());
 
     Router::new()
         .merge(routes::health_routes())
@@ -55,7 +61,9 @@ mod tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://user:password@localhost/test")
             .expect("测试数据库连接字符串应合法");
-        create_app(pool, &test_config())
+        // Redis 使用不建立连接的实例：用例只覆盖路由、校验与认证中间件，
+        // 不依赖真实 Redis；Redis 命令失败时的降级行为由各模块的单元测试覆盖。
+        create_app(pool, crate::infrastructure::redis::RedisStore::without_connection(), &test_config())
     }
 
     /// 构造测试用配置。
@@ -72,6 +80,12 @@ mod tests {
                 max_connections: 1,
             },
             log: crate::config::LogConfig { level: "info".to_owned() },
+            redis: crate::config::RedisConfig {
+                url: "redis://127.0.0.1:6379".to_owned(),
+                pool_size: 2,
+                key_prefix: "axum-test".to_owned(),
+                user_cache_ttl_seconds: 60,
+            },
             jwt: JwtConfig {
                 secret: "integration-test-secret-32-characters".to_owned(),
                 issuer: "rust-axum-server-test".to_owned(),
@@ -88,6 +102,14 @@ mod tests {
                     same_site: "strict".to_owned(),
                     path: "/".to_owned(),
                 },
+            },
+            bootstrap: crate::config::BootstrapConfig {
+                // 测试不初始化数据库，引导账号必须保持关闭。
+                enabled: false,
+                username: "admin".to_owned(),
+                email: "admin@example.com".to_owned(),
+                password: String::new(),
+                nickname: None,
             },
         }
     }

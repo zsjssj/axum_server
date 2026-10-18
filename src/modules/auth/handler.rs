@@ -19,7 +19,7 @@ use crate::common::{
 use crate::config::CookieConfig;
 use crate::modules::auth::{
     model::{AuthSessionResponse, CurrentUserResponse, LoginRequest, TokenPair},
-    service::AuthService,
+    service::{AuthService, LoginContext},
 };
 
 /// 认证路由。
@@ -175,12 +175,15 @@ pub(crate) async fn login(
 
     let tokens = AuthService::login(
         &state.db,
+        &state.redis,
         &state.jwt,
         &state.auth,
         &req.username,
         &req.password,
-        client.ip.as_deref(),
-        client.user_agent.as_deref(),
+        LoginContext {
+            client_ip: client.ip.as_deref(),
+            user_agent: client.user_agent.as_deref(),
+        },
     )
     .await?;
 
@@ -231,6 +234,16 @@ pub(crate) async fn refresh_token(
 }
 
 /// 用户登出
+///
+/// 登出需要撤销两类凭据，顺序是先吊销刷新令牌会话，再把当前 access token
+/// 写入吊销列表：
+///
+/// - 刷新令牌会话落库，必须吊销，否则攻击者可以继续续期；
+/// - access token 无状态，只能借助 Redis 吊销列表在自然过期前失效。
+///
+/// 两次吊销都是「尽力而为」：任何一步失败都只记录告警并继续清除 Cookie。
+/// 让客户端卡在"无法退出"的状态比一次吊销失败更糟，而且 Cookie 清除本身
+/// 已经能阻止该浏览器继续使用令牌。
 #[utoipa::path(
     post,
     path = "/api/v1/auth/logout",
@@ -244,13 +257,22 @@ pub(crate) async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    if let Some(refresh_token) = cookie::refresh_token_from_headers(&headers, &state.auth.cookie) {
-        // 先吊销服务端会话；吊销失败只记录日志而不中断，随后仍会清除 Cookie。
-        // 让客户端卡在"无法退出"的状态比一次吊销失败更糟，且 Cookie 清除本身
-        // 已能阻止该浏览器继续使用令牌。
-        if let Err(error) = AuthService::logout(&state.db, &refresh_token).await {
-            tracing::warn!(?error, "登出时吊销会话失败，仍继续清除客户端 Cookie");
-        }
+    if let Some(refresh_token) = cookie::refresh_token_from_headers(&headers, &state.auth.cookie)
+        && let Err(error) = AuthService::logout(&state.db, &refresh_token).await
+    {
+        tracing::warn!(?error, "登出时吊销会话失败，仍继续清除客户端 Cookie");
+    }
+
+    // access token 可能因浏览器只发送了部分 Cookie 而缺失，此时只清理刷新令牌会话。
+    // 吊销写入失败同样不阻断登出：Redis 故障时退化为「令牌到期才失效」。
+    if let Some(access_token) = cookie::access_token_from_headers(&headers, &state.auth.cookie)
+        && let Err(error) =
+            AuthService::revoke_access_token(&state.redis, &state.jwt, &access_token).await
+    {
+        tracing::warn!(
+            ?error,
+            "登出时写入 access token 吊销列表失败，令牌将在自然过期前继续有效"
+        );
     }
 
     // 即使没有令牌也返回成功：登出是幂等操作，

@@ -3,10 +3,12 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::common::error::AppError;
 use crate::config::{AuthConfig, JwtConfig};
+use crate::infrastructure::redis::RedisStore;
 use crate::modules::auth::model::{CurrentUserResponse, TokenPair};
 use crate::modules::auth::repository::AuthRepository;
 use crate::modules::user::repository::UserRepository;
@@ -24,6 +26,17 @@ const REFRESH_TOKEN_BYTES: usize = 32;
 /// 依赖配置由调用方以参数传入而不是从全局读取，使该层保持可测试，
 /// 也避免在业务代码中散落配置访问。
 pub struct AuthService;
+
+/// 校验通过的 access token 中与授权、吊销有关的信息。
+///
+/// 中间件除了用户身份之外还需要 `jti`（吊销列表的键），因此不再只返回用户主键。
+#[derive(Debug, Clone)]
+pub struct VerifiedAccessToken {
+    /// 用户内部主键，取自 `sub`。
+    pub user_id: i64,
+    /// 令牌唯一标识，作为吊销记录的键。
+    pub jti: String,
+}
 
 /// access token 负载。
 ///
@@ -46,27 +59,39 @@ struct AccessClaims {
     typ: String,
 }
 
+/// 登录请求的客户端信息，仅用于安全审计。
+///
+/// 单独成结构体而不是继续增加参数：登录需要数据库、Redis、两份配置和凭证，
+/// 参数过多时调用点很容易把 `client_ip` 与 `user_agent` 传反，
+/// 而两者一旦互换不会编译失败，只会把审计数据写成垃圾。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoginContext<'a> {
+    pub client_ip: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
+
 impl AuthService {
     /// 用户登录：核验凭证并签发令牌对。
     ///
-    /// `client_ip` 与 `user_agent` 仅用于安全审计记录，不参与认证判定。
+    /// `context` 中的客户端信息仅用于安全审计记录，不参与认证判定。
     pub async fn login(
         db: &PgPool,
+        redis: &RedisStore,
         jwt_config: &JwtConfig,
         auth_config: &AuthConfig,
         username: &str,
         password: &str,
-        client_ip: Option<&str>,
-        user_agent: Option<&str>,
+        context: LoginContext<'_>,
     ) -> Result<TokenPair, AppError> {
         let now = Utc::now();
+        let window = rate_limit_window(auth_config);
         let window_start = now - ChronoDuration::minutes(auth_config.login_window_minutes);
 
         // 先判定限流，再执行密码校验。顺序不能颠倒：Argon2 校验被刻意设计得很慢，
         // 若先校验密码，大量失败请求会持续占用阻塞线程池，使限流本身变成
         // 消耗服务端算力的攻击面。
         let recent_failures =
-            AuthRepository::count_failures_since(db, username, window_start).await?;
+            Self::count_login_failures(db, redis, username, window, window_start).await?;
         if recent_failures >= auth_config.max_login_failures {
             tracing::warn!(%username, recent_failures, "登录失败次数超过阈值，暂时拒绝登录");
             return Err(AppError::TooManyRequests("登录失败次数过多，请稍后再试"));
@@ -78,7 +103,7 @@ impl AuthService {
         // 响应耗时会明显短于"用户存在但密码错误"，攻击者可据此枚举有效用户名。
         let Some(credentials) = credentials else {
             let _ = verify_password_dummy(password).await;
-            AuthRepository::record_failure(db, username, client_ip).await?;
+            Self::record_login_failure(db, redis, username, context.client_ip, window).await?;
             return Err(invalid_credentials());
         };
 
@@ -87,12 +112,17 @@ impl AuthService {
         let password_valid = verify_password(password, &credentials.password_hash).await?;
 
         if !password_valid {
-            AuthRepository::record_failure(db, username, client_ip).await?;
+            Self::record_login_failure(db, redis, username, context.client_ip, window).await?;
             return Err(invalid_credentials());
         }
 
         // 登录成功即视为已恢复访问，清理窗口外的历史失败记录。
         // 顺带清理避免为此单独引入定时任务，窗口外记录已不参与判定。
+        //
+        // 注意这里只清理数据库中的过期审计记录，不清空 Redis 中的窗口内计数：
+        // 成功登录不能证明之前的失败不是攻击行为，清空计数等于给攻击者一个
+        // 「只要偶尔成功一次就能重置限额」的入口。窗口外的成员会在下次读取时
+        // 被脚本修剪，键本身也带 TTL，不需要额外维护。
         AuthRepository::clear_failures_before(db, username, window_start).await?;
 
         Self::issue_token_pair(
@@ -100,10 +130,55 @@ impl AuthService {
             jwt_config,
             credentials.id,
             credentials.public_id,
-            client_ip,
-            user_agent,
+            context.client_ip,
+            context.user_agent,
         )
         .await
+    }
+
+    /// 统计窗口内的登录失败次数。
+    ///
+    /// Redis 是判定用的加速层，数据库是权威审计来源：Redis 不可用时回退为
+    /// 直接统计 `login_failures` 表。这条回退路径保证 Redis 故障不会让登录
+    /// 保护整体失效，代价只是这一次判定慢一点。
+    async fn count_login_failures(
+        db: &PgPool,
+        redis: &RedisStore,
+        username: &str,
+        window: Duration,
+        window_start: DateTime<Utc>,
+    ) -> Result<i64, AppError> {
+        match redis.login_failure_count(username, window).await {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                tracing::warn!(%error, %username, "Redis 登录失败计数不可用，回退到数据库统计");
+                Ok(AuthRepository::count_failures_since(db, username, window_start).await?)
+            }
+        }
+    }
+
+    /// 记录一次登录失败。
+    ///
+    /// 先写数据库审计，再写 Redis 计数。Redis 写入失败只告警：审计记录已经落库，
+    /// 后续判定会自动回退到数据库统计，因此本次请求不需要以失败告终。
+    async fn record_login_failure(
+        db: &PgPool,
+        redis: &RedisStore,
+        username: &str,
+        client_ip: Option<&str>,
+        window: Duration,
+    ) -> Result<(), AppError> {
+        AuthRepository::record_failure(db, username, client_ip).await?;
+
+        if let Err(error) = redis.record_login_failure(username, window).await {
+            tracing::warn!(
+                %error,
+                %username,
+                "Redis 登录失败计数写入失败，后续判定将回退到数据库统计"
+            );
+        }
+
+        Ok(())
     }
 
     /// 使用刷新令牌换取新的令牌对。
@@ -177,14 +252,54 @@ impl AuthService {
         Ok(())
     }
 
-    /// 解析 access token 并返回令牌负载中的用户内部主键。
-    pub fn verify_access_token(jwt_config: &JwtConfig, token: &str) -> Result<i64, AppError> {
+    /// 把 access token 写入吊销列表，使它在自然过期前立即失效。
+    ///
+    /// 换入 Redis 之后，「登出立即失效 access token」才真正成立：
+    /// 在此之前只能等令牌自然过期（`access_ttl_minutes`），因为服务端不保存
+    /// 任何 access token 状态。吊销记录只需要「令牌唯一标识 + 剩余有效期」，
+    /// 用一条带 TTL 的字符串即可表达，令牌过期后记录也会自动消失。
+    ///
+    /// 无法解析或已过期的令牌直接返回成功：这类令牌本来就通不过认证中间件，
+    /// 写入一条永远不会被查询的记录没有意义。
+    pub async fn revoke_access_token(
+        redis: &RedisStore,
+        jwt_config: &JwtConfig,
+        token: &str,
+    ) -> Result<(), AppError> {
+        let Ok(claims) = decode_access_claims(jwt_config, token) else {
+            return Ok(());
+        };
+
+        let remaining = claims.exp - Utc::now().timestamp();
+        if remaining <= 0 {
+            return Ok(());
+        }
+
+        redis
+            .revoke_access_token(&claims.jti, Duration::from_secs(remaining as u64))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "写入 access token 吊销列表失败");
+                AppError::Internal("令牌吊销失败")
+            })
+    }
+
+    /// 解析 access token，返回用户身份、吊销标识与到期时间。
+    pub fn verify_access_token(
+        jwt_config: &JwtConfig,
+        token: &str,
+    ) -> Result<VerifiedAccessToken, AppError> {
         let claims = decode_access_claims(jwt_config, token)?;
 
-        claims
+        let user_id = claims
             .sub
             .parse::<i64>()
-            .map_err(|_| AppError::Unauthorized("认证令牌无效"))
+            .map_err(|_| AppError::Unauthorized("认证令牌无效"))?;
+
+        Ok(VerifiedAccessToken {
+            user_id,
+            jti: claims.jti,
+        })
     }
 
     /// 签发一个 access token，仅供测试构造已登录请求使用。
@@ -281,6 +396,14 @@ impl AuthService {
 /// 枚举出系统中真实存在的用户名。
 fn invalid_credentials() -> AppError {
     AppError::Unauthorized("用户名或密码错误")
+}
+
+/// 把配置中的分钟窗口转换为 `Duration`。
+///
+/// 至少保证一分钟：零长度窗口会让 Redis 中所有失败记录立即过期，
+/// 相当于关闭限流。配置校验已经拒绝非正数，这里只是防线内的兜底。
+fn rate_limit_window(auth_config: &AuthConfig) -> Duration {
+    Duration::from_secs((auth_config.login_window_minutes * 60).max(60) as u64)
 }
 
 /// 签发 access token。
@@ -441,10 +564,11 @@ mod tests {
         let token =
             encode_access_token(&config, 42, Uuid::now_v7(), now).expect("access token 应签发成功");
 
-        let user_id =
+        let verified =
             AuthService::verify_access_token(&config, &token).expect("刚签发的令牌应通过校验");
 
-        assert_eq!(user_id, 42);
+        assert_eq!(verified.user_id, 42);
+        assert!(!verified.jti.is_empty(), "jti 用作吊销键，不能为空");
     }
 
     #[test]
@@ -546,11 +670,64 @@ mod tests {
         );
     }
 
+    /// 窗口至少一分钟：零长度窗口等于关闭限流。
+    #[test]
+    fn rate_limit_window_is_never_shorter_than_a_minute() {
+        let config = AuthConfig {
+            max_login_failures: 5,
+            login_window_minutes: 15,
+            cookie: crate::config::CookieConfig {
+                access_name: "access_token".to_owned(),
+                refresh_name: "refresh_token".to_owned(),
+                secure: false,
+                same_site: "strict".to_owned(),
+                path: "/".to_owned(),
+            },
+        };
+
+        assert_eq!(rate_limit_window(&config), Duration::from_secs(900));
+
+        let mut zero_window = config.clone();
+        zero_window.login_window_minutes = 0;
+        assert_eq!(
+            rate_limit_window(&zero_window),
+            Duration::from_secs(60),
+            "非法窗口应兜底为一分钟，而不是变成零"
+        );
+    }
+
+    /// 无法解析的令牌不应触发任何 Redis 写入：它本来就通不过认证中间件。
+    #[tokio::test]
+    async fn skips_revocation_for_unparsable_token() {
+        let store = crate::infrastructure::redis::RedisStore::without_connection();
+
+        let result = AuthService::revoke_access_token(&store, &test_jwt_config(), "not-a-jwt").await;
+
+        assert!(
+            result.is_ok(),
+            "无法解析的令牌应直接返回成功，且不访问 Redis"
+        );
+    }
+
+    /// 已过期的令牌无需写入吊销列表：它已经不可能通过认证。
+    #[tokio::test]
+    async fn skips_revocation_for_expired_token() {
+        let store = crate::infrastructure::redis::RedisStore::without_connection();
+        let mut config = test_jwt_config();
+        config.access_ttl_minutes = -10;
+        let expired = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now())
+            .expect("access token 应签发成功");
+        config.access_ttl_minutes = 15;
+
+        let result = AuthService::revoke_access_token(&store, &config, &expired).await;
+
+        assert!(result.is_ok(), "过期令牌应直接跳过吊销写入");
+    }
+
     #[test]
     fn generates_unique_refresh_tokens() {
         let first = generate_refresh_token();
         let second = generate_refresh_token();
-
         assert_ne!(first, second, "刷新令牌必须每次不同");
         // 32 字节十六进制编码后长度为 64。
         assert_eq!(first.len(), 64);
