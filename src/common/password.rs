@@ -1,6 +1,7 @@
 use argon2::{
-    Argon2, PasswordHasher,
-    password_hash::{SaltString, rand_core::OsRng},
+    Argon2,
+    PasswordHasher,
+    // password_hash::{SaltString, rand_core::OsRng},
 };
 
 use crate::common::error::AppError;
@@ -12,10 +13,14 @@ use crate::common::error::AppError;
 pub fn hash_password(password: &str) -> Result<String, AppError> {
     // 每次哈希都使用独立随机盐，使相同密码得到不同结果，
     // 从而阻止攻击者通过比对哈希值批量识别使用相同密码的账号。
-    let salt = SaltString::generate(&mut OsRng);
-
+    // let salt = SaltString::generate(&mut OsRng);
+    // Argon2::default()
+    //     .hash_password(password.as_bytes(), &salt)
+    //     .map(|hash| hash.to_string())
+    //     .map_err(|_| AppError::Internal("密码哈希失败"))
+    // 0.6版本自动生成随机盐，不需要调用者手动生成
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|_| AppError::Internal("密码哈希失败"))
 }
@@ -30,11 +35,7 @@ mod tests {
         let encoded = hash_password("secret").expect("密码应哈希成功");
         let parsed = PasswordHash::new(&encoded).expect("哈希应为合法格式");
 
-        assert!(
-            Argon2::default()
-                .verify_password(b"secret", &parsed)
-                .is_ok()
-        );
+        assert!(Argon2::default().verify_password(b"secret", &parsed).is_ok());
         assert_ne!(encoded, "secret", "哈希结果不应等于原始密码");
     }
 

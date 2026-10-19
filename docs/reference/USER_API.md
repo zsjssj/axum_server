@@ -1,5 +1,8 @@
 # 用户模块 API 文档
 
+> **文档定位**：本文是**参考手册**，用于查阅既定事实与操作步骤。
+> 想按学习顺序理解设计意图，请从 [`../README.md`](../README.md) 开始读教程章节。
+
 本项目使用 Utoipa 从代码注解自动生成 OpenAPI 文档，接口路径、参数、请求体、响应模型和状态码均以生成结果为准，不再在 Markdown 中重复维护数据结构。
 
 ## 文档入口
@@ -120,7 +123,7 @@ HTTP 状态码仍保持标准语义，不统一强制返回 `200`；客户端应
 - Model 的 `ToSchema`：请求与响应 Schema。
 - 查询参数模型的 `IntoParams`：查询参数定义。
 - `src/app/openapi.rs`：统一注册新增的接口和 Schema。
-- `src/modules/user/service.rs`：缓存读写与写操作后的失效逻辑（调整缓存键或 TTL 时同步更新本文档与 `docs/REDIS_GUIDE.md`）。
+- `src/modules/user/service.rs`：缓存读写与写操作后的失效逻辑（调整缓存键或 TTL 时同步更新本文档与 `docs/reference/REDIS_GUIDE.md`）。
 
 完成修改后运行：
 
@@ -132,12 +135,12 @@ cargo test
 
 ## 命令行示例
 
-用户接口需要登录，因此先用 `-c` 保存登录后的 Cookie，再用 `-b` 携带。**数据库为空时没有任何账号能登录**（创建用户接口自身也要求登录），需要先按 `docs/AUTH_API.md` 的「首次启动：第一个账号从哪里来」创建引导账号：
+用户接口需要登录，因此先用 `-c` 保存登录后的 Cookie，再用 `-b` 携带。**数据库为空时没有任何账号能登录**（创建用户接口自身也要求登录），需要先按 `docs/reference/AUTH_API.md` 的「首次启动：第一个账号从哪里来」创建引导账号：
 
 ```bash
 # 0. 登录并保存令牌 Cookie
 #    用户名与口令取自引导账号配置（bootstrap.username / bootstrap.password），
-#    详见 docs/AUTH_API.md 的「首次启动」一节。
+#    详见 docs/reference/AUTH_API.md 的「首次启动」一节。
 curl -c cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"your-admin","password":"your-bootstrap-password"}'

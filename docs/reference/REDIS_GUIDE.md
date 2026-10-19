@@ -1,5 +1,8 @@
 # Redis 学习与项目实战指南
 
+> **文档定位**：本文是**参考手册**，用于查阅既定事实与操作步骤。
+> 想按学习顺序理解设计意图，请从 [`../README.md`](../README.md) 开始读教程章节。
+
 本文既是 Redis 的入门教程，也是本项目 Redis 用法的设计说明。读完并动手做完第 7 节的实验后，你应该能够：
 
 - 说清 Redis 适合做什么、不适合做什么，以及它在本项目中承担哪三件事；
@@ -68,7 +71,7 @@ Windows 上没有官方 Redis 安装包，最省事的方式是 Docker：
 
 ```bash
 # 启动一个带密码的 Redis 7（密码请自行替换）
-docker run --name axum-redis -p 6379:6379 -d redislatest \
+docker run --name axum-redis -p 6379:6379 -d redis:7 \
   redis-server --requirepass "dev-password"
 
 # 查看是否启动成功
@@ -595,7 +598,7 @@ Redis 在本项目是「可选加速组件」，每个使用点都定义了降�
 
 ## 7. 动手实验：观察每一项功能
 
-以下实验需要：PostgreSQL 可用、Redis 可用、服务已启动、已有一个可登录账号（见 `docs/AUTH_API.md` 的「首次启动」）。命令行以 `curl` 为例，Windows PowerShell 中把 `\` 换行改为反引号或写在一行里。
+以下实验需要：PostgreSQL 可用、Redis 可用、服务已启动、已有一个可登录账号（见 `docs/reference/AUTH_API.md` 的「首次启动」）。命令行以 `curl` 为例，Windows PowerShell 中把 `\` 换行改为反引号或写在一行里。
 
 ### 实验 1：观察登录失败计数
 
@@ -877,8 +880,8 @@ docker start axum-redis
 Redis 用法发生变化（新增键空间、调整降级策略、修改 TTL 语义）时，需要同时更新：
 
 - 本文档第 6 节（场景）、第 11 节（对照表）；
-- `docs/ARCHITECTURE.md`（技术组件、启动流程、状态与缓存说明）；
-- `docs/AUTH_API.md`（登录保护、登出语义、配置表）；
+- `docs/reference/ARCHITECTURE.md`（技术组件、启动流程、状态与缓存说明）；
+- `docs/reference/AUTH_API.md`（登录保护、登出语义、配置表）；
 - `config/default.toml` 与 `.env.example`（默认值与环境变量）。
 
 完成修改后运行：

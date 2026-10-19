@@ -35,7 +35,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|error| format!("引导账号初始化失败: {error:?}"))?;
     // Redis 是可选加速组件：创建失败或首次探测失败都只告警，不阻断启动。
-    // 理由是本项目的每一项 Redis 功能都有降级路径（详见 docs/REDIS_GUIDE.md），
+    // 理由是本项目的每一项 Redis 功能都有降级路径（详见 docs/reference/REDIS_GUIDE.md），
     // 为了让一个缓存组件拖垮整个服务并不划算；同时 /ready 会把实例标记为未就绪，
     // 生产环境的编排系统据此不会把流量路由到没有 Redis 的实例上。
     let redis_store = RedisStore::from_config(&config.redis)

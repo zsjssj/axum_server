@@ -33,7 +33,7 @@ pub struct LogConfig {
 /// Redis 在本项目中承担三类「读写频繁、可以重建」的状态：
 /// 登录失败计数、access token 吊销列表、用户资料缓存。
 /// 它们都有一个共同点：丢失后可以接受，因此 Redis 停机时各项功能会降级
-///（详见 `docs/REDIS_GUIDE.md`），而数据库中的权威数据不受影响。
+///（详见 `docs/reference/REDIS_GUIDE.md`），而数据库中的权威数据不受影响。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RedisConfig {
     /// 连接地址，例如 `redis://127.0.0.1:6379` 或带密码的

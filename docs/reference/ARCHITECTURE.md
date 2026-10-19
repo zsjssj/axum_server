@@ -1,5 +1,8 @@
 # 项目架构与设计说明
 
+> **文档定位**：本文是**参考手册**，用于查阅架构分层、启动流程、认证设计与错误码等既定事实。
+> 想按学习顺序理解"为什么这样设计"，请从 [`../README.md`](../README.md) 开始读教程章节。
+
 ## 1. 项目定位
 
 本项目是基于 Rust、Axum 与 PostgreSQL 构建的 HTTP API 服务。当前以用户模块为示例，采用按业务模块组织代码、模块内部按职责分层的结构，目标是让路由、业务逻辑和数据访问保持清晰边界，并为后续增加其他业务模块预留统一的扩展方式。
@@ -23,7 +26,8 @@
 ```text
 rust-axum-server/
 ├── config/                 # 默认配置和分环境配置
-├── docs/                   # 架构与接口文档（含 Redis 学习指南）
+├── docs/                   # 教程章节（01-14）、总入口 README.md
+│   └── reference/          # 参考手册：架构、认证 API、用户 API、Redis 指南
 ├── migrations/             # 数据库迁移脚本
 └── src/
     ├── app/                # 应用装配、全局状态、路由、中间件和启动期初始化（含引导账号）
@@ -371,4 +375,4 @@ src/modules/{module}/
 
 认证采用 Cookie 方案，因此**不注册 `bearer_auth` 安全方案**：残留的 Bearer 方案会让调用方误以为存在 `Authorization` 头这条认证路径。同理也不注册 `apiKey` 形式的 Cookie 安全方案——OpenAPI 的 `apiKey` 只能声明「安全方案」，无法表达 HttpOnly、SameSite 等实际生效的约束，不如在接口描述与文档中说明。
 
-服务启动后可通过 `/swagger-ui/` 浏览交互式文档，通过 `/api-docs/openapi.json` 获取 OpenAPI JSON。**经 Swagger UI 调试受保护接口前，需要先调用登录接口**，浏览器会把返回的 Cookie 自动带上（Swagger UI 的请求与页面同源，因此能携带 Cookie）。新增或调整接口时，必须同步调整代码注解；手写 Markdown 只保留使用说明，不再重复维护完整的接口结构。各模块文档见 `docs/USER_API.md` 与 `docs/AUTH_API.md`；Redis 的概念、实战与排错见 `docs/REDIS_GUIDE.md`。
+服务启动后可通过 `/swagger-ui/` 浏览交互式文档，通过 `/api-docs/openapi.json` 获取 OpenAPI JSON。**经 Swagger UI 调试受保护接口前，需要先调用登录接口**，浏览器会把返回的 Cookie 自动带上（Swagger UI 的请求与页面同源，因此能携带 Cookie）。新增或调整接口时，必须同步调整代码注解；手写 Markdown 只保留使用说明，不再重复维护完整的接口结构。各模块文档见 `docs/reference/USER_API.md` 与 `docs/reference/AUTH_API.md`；Redis 的概念、实战与排错见 `docs/reference/REDIS_GUIDE.md`。教程章节见 `docs/README.md`。
