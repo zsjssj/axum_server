@@ -37,7 +37,7 @@ Redis       = 加速依赖：不可用 → 各功能按明确策略降级，就�
 ## 10.2 适配层：把 Redis 关进一个文件
 
 ```rust
-// src/infrastructure/redis.rs:127
+// src/infrastructure/redis.rs:117
 #[derive(Clone)]
 pub struct RedisStore {
     pool: RedisPool,           // bb8 连接池
@@ -62,14 +62,21 @@ pub async fn get_json<T>(&self, key: &str) -> Option<T> {
 ### 错误分类：为了排障，不为好看
 
 ```rust
-// src/infrastructure/redis.rs:45
+// src/infrastructure/redis.rs:50
+#[derive(Debug, Error)]
 pub enum RedisStoreError {
-    Config(String),        // 地址无法解析
-    Connection(String),    // 取连接失败：Redis 不可达/超时/被拒绝
-    Command(RedisError),   // 命令执行失败：键类型不匹配、脚本报错
-    Serde(serde_json::Error),  // 序列化失败：程序缺陷，不是 Redis 故障
+    #[error("Redis 配置不合法：{0}")]
+    Config(String),                     // 地址无法解析
+    #[error("Redis 连接不可用：{0}")]
+    Connection(String),                 // 取连接失败：Redis 不可达/超时/被拒绝
+    #[error("Redis 命令执行失败：{0}")]
+    Command(#[from] RedisError),        // 命令执行失败：键类型不匹配、脚本报错
+    #[error("缓存值序列化失败：{0}")]
+    Serde(#[from] serde_json::Error),   // 序列化失败：程序缺陷，不是 Redis 故障
 }
 ```
+
+文案、`source` 与 `From` 转换都由 `thiserror` 在变体上声明。这一点在「错误分类」这种类型上尤其重要：以前手写 `impl Error` 的 `source()` 时，只有 `Command` 和 `Serde` 有底层原因，`Config` 与 `Connection` 没有——这个差异藏在另一个 `match` 里，新增变体时很容易忘记维护。现在 `#[from]` 直接写在变体上，读枚举就知道来源链，`From<RedisError>` / `From<serde_json::Error>` 也顺带生成，调用处的 `.map_err(RedisStoreError::Command)` 写法不变。
 
 分这么细的价值在排障：
 
@@ -85,7 +92,7 @@ pub enum RedisStoreError {
 ### 键命名空间：多环境共用一个实例时的唯一隔离手段
 
 ```rust
-// src/infrastructure/redis.rs:349
+// src/infrastructure/redis.rs:300
 fn normalize_prefix(prefix: &str) -> String {
     prefix.trim().trim_matches(':').to_owned()
 }
@@ -96,7 +103,7 @@ fn normalize_prefix(prefix: &str) -> String {
 三个键构造器：
 
 ```rust
-// src/infrastructure/redis.rs:314
+// src/infrastructure/redis.rs:267
 pub fn login_failure_key(&self, username: &str) -> String  { self.namespaced(&format!("auth:login_failures:{username}")) }
 pub fn revoked_access_key(&self, jti: &str) -> String      { self.namespaced(&format!("auth:revoked_access:{jti}")) }
 pub fn user_detail_key(&self, public_id: Uuid) -> String   { self.namespaced(&format!("user:detail:{public_id}")) }
@@ -107,14 +114,14 @@ pub fn user_detail_key(&self, public_id: Uuid) -> String   { self.namespaced(&fo
 **为什么要分三类键空间？** 因为它们的数据类型、TTL、清理策略完全不同。混在一起时，一次"清缓存"就可能把限流计数一起删掉。测试锁定了这一点：
 
 ```rust
-// src/infrastructure/redis.rs:409
+// src/infrastructure/redis.rs:360
 fn key_categories_do_not_collide() { assert_ne!(store.login_failure_key("x"), store.revoked_access_key("x")); }
 ```
 
 ### 连接池：为什么不是"一请求一连接"
 
 ```rust
-// src/infrastructure/redis.rs:32
+// src/infrastructure/redis.rs:33
 /// 池中保存的是 `MultiplexedConnection`：redis-rs 的一条多路复用连接本身就能
 /// 承载并发请求，因此这里的池**不是**「一个请求一条连接」，而是限制突发并发
 /// 与连接重建次数。
@@ -123,7 +130,7 @@ fn key_categories_do_not_collide() { assert_ne!(store.login_failure_key("x"), st
 Redis 协议支持在一条连接上并发多个请求（请求带序号，响应回来匹配）。所以 `pool_size = 8` 已经能支撑相当大的吞吐，不要按"并发数"来配。
 
 ```rust
-// src/infrastructure/redis.rs:153
+// src/infrastructure/redis.rs:143
 pub fn from_config(config: &RedisConfig) -> Result<Self, RedisStoreError> {
     let client = Client::open(config.url.clone()).map_err(|e| RedisStoreError::Config(e.to_string()))?;
 
@@ -139,14 +146,14 @@ pub fn from_config(config: &RedisConfig) -> Result<Self, RedisStoreError> {
 `build_unchecked` 是个关键选择，带来两个好处：
 
 1. **启动流程可以自己决定"连不上要不要退出"**——构造函数只管建骨架，探测交给 `ping()`。
-2. **单元测试可以构造完整的 `AppState`**，不需要真的跑一个 Redis（`RedisStore::without_connection()`，`:367`）。
+2. **单元测试可以构造完整的 `AppState`**，不需要真的跑一个 Redis（`RedisStore::without_connection()`，`:318`）。
 
 代价是"构造成功"不代表"能连上"，所以启动流程里必须显式 `ping()` 一次——这正是[第 02 章](./02-项目全景与启动流程.md)里第 8 步的由来。
 
 **为什么保留检出前 `PING`**
 
 ```rust
-// src/infrastructure/redis.rs:145
+// src/infrastructure/redis.rs:135
 /// 保留 `test_on_check_out` 的默认值（首次使用前 `PING`）：redis-rs 的
 /// `has_broken` 恒返回 `false`，池无法自行发现失效连接，检出前的 `PING`
 /// 是唯一能让坏连接被剔除的机制。
@@ -179,7 +186,7 @@ pub fn from_config(config: &RedisConfig) -> Result<Self, RedisStoreError> {
 **读取 + 修剪**（判定用）：
 
 ```lua
--- src/infrastructure/redis.rs:89
+-- src/infrastructure/redis.rs:79
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
@@ -190,7 +197,7 @@ return redis.call('ZCARD', key)
 **修剪 + 写入 + 续期 + 统计**（记录用）：
 
 ```lua
--- src/infrastructure/redis.rs:108
+-- src/infrastructure/redis.rs:98
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
@@ -213,7 +220,7 @@ Lua 脚本在 Redis 里是**原子执行**的（单线程模型下整段连续�
 ### `member` 为什么用 UUIDv7
 
 ```rust
-// src/infrastructure/redis.rs:218
+// src/infrastructure/redis.rs:196
 // 成员用 UUIDv7：同一毫秒内的两次失败也不会互相覆盖。
 // 计数的精度依赖成员唯一，这里不能退化成「时间戳作为成员」。
 let member = Uuid::now_v7().to_string();
@@ -224,7 +231,7 @@ ZSET 的成员是唯一的。如果用毫秒时间戳当成员，同一毫秒内
 ### 毫秒与最小值的兜底
 
 ```rust
-// src/infrastructure/redis.rs:360
+// src/infrastructure/redis.rs:311
 fn window_millis(window: Duration) -> i64 {
     window.as_millis().max(1) as i64      // 窗口为 0 会让所有成员立即过期 = 关闭限流
 }
@@ -242,7 +249,7 @@ fn window_millis(window: Duration) -> i64 {
 ## 10.4 场景二：access token 吊销列表（STRING + TTL）
 
 ```rust
-// src/infrastructure/redis.rs:239
+// src/infrastructure/redis.rs:215
 pub async fn revoke_access_token(&self, jti: &str, ttl: Duration) -> Result<(), RedisStoreError> {
     let key = self.revoked_access_key(jti);
     let mut connection = self.connection().await?;
@@ -253,7 +260,7 @@ pub async fn revoke_access_token(&self, jti: &str, ttl: Duration) -> Result<(), 
 ```
 
 ```rust
-// src/infrastructure/redis.rs:254
+// src/infrastructure/redis.rs:226
 pub async fn is_access_token_revoked(&self, jti: &str) -> Result<bool, RedisStoreError> {
     let key = self.revoked_access_key(jti);
     let mut connection = self.connection().await?;
@@ -278,7 +285,7 @@ pub async fn is_access_token_revoked(&self, jti: &str) -> Result<bool, RedisStor
 ## 10.5 场景三：用户详情缓存（Cache-Aside）
 
 ```rust
-// src/infrastructure/redis.rs:269
+// src/infrastructure/redis.rs:238
 pub async fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, RedisStoreError> {
     let raw: Option<String> = connection.get(key).await.map_err(RedisStoreError::Command)?;
     match raw {

@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use thiserror::Error;
 use utoipa::ToSchema;
 use validator::ValidationErrors;
 
@@ -29,47 +30,54 @@ pub struct ErrorData {
 /// 转换为 HTTP 状态码、业务码与 `ApiResponse` 响应信封，避免各层重复拼装错误响应。
 /// 变体携带的 `&'static str` 为可直接展示给调用方的中文提示，不应包含数据库结构、
 /// SQL 或连接信息等敏感内容。
-#[derive(Debug)]
+///
+/// `Display` 与 `source` 由 `thiserror` 派生：`Display` 只是日志与启动报错用的摘要，
+/// **不作为**响应体内容，对外提示一律由 [`IntoResponse`] 里的常量决定，因此可以安全地
+/// 与响应文案分开维护；`source` 链则由 `#[from]` 自动建立，不必再手写 `source()` 分支。
+#[derive(Debug, Error)]
 pub enum AppError {
     // 字段级参数校验失败，对应 `422` 与业务码 `40001`，响应中会附带 `ErrorData` 明细。
-    Validation(ValidationErrors),
+    #[error("请求参数校验失败")]
+    Validation(#[from] ValidationErrors),
     /// 请求格式或参数不合法，例如路径、查询参数解析失败，对应 `400` 与业务码 `40000`。
+    #[error("{0}")]
     BadRequest(&'static str),
     /// 请求语义不可处理，例如 JSON 结构正确但字段取值非法，对应 `422` 与业务码 `40001`。
+    #[error("{0}")]
     UnprocessableEntity(&'static str),
     /// 请求媒体类型不受支持，例如 `Content-Type` 非 `application/json`，对应 `415` 与业务码 `40002`。
+    #[error("{0}")]
     UnsupportedMediaType(&'static str),
     /// 目标资源不存在，例如未知接口或查询不到记录，对应 `404` 与业务码 `40400`。
+    #[error("{0}")]
     NotFound(&'static str),
     /// 请求方法不被路由允许，对应 `405` 与业务码 `40500`，提示语固定无需携带内容。
+    #[error("请求方法不被允许")]
     MethodNotAllowed,
     /// 未认证或凭证无效，对应 `401` 与业务码 `40100`。
     ///
     /// 登录失败统一使用该变体且提示语保持一致，避免通过响应差异区分
     /// 「用户不存在」与「密码错误」，形成用户名枚举通道。
+    #[error("{0}")]
     Unauthorized(&'static str),
     /// 触发登录保护等频率限制，对应 `429` 与业务码 `42900`。
+    #[error("{0}")]
     TooManyRequests(&'static str),
     /// 依赖服务不可用，例如数据库探测失败，对应 `503` 与业务码 `50300`。
+    #[error("{0}")]
     ServiceUnavailable(&'static str),
     /// 业务状态冲突，例如唯一键重复，对应 `409` 与业务码 `40900`。
+    #[error("{0}")]
     Conflict(&'static str),
     /// 数据库操作失败，细节仅写入服务端日志，对外统一返回 `500` 与业务码 `50000`。
-    Database(sqlx::Error),
+    ///
+    /// `Display` 只保留「数据库操作失败」这一个摘要，原始原因留在 `source` 链里：
+    /// 万一将来有人把 `AppError` 的 `Display` 写进响应，也不会带出 SQL 与连接信息。
+    #[error("数据库操作失败")]
+    Database(#[from] sqlx::Error),
     /// 内部未预期错误，例如任务失败，对外统一返回 `500` 与业务码 `50000`。
+    #[error("{0}")]
     Internal(&'static str),
-}
-
-impl From<sqlx::Error> for AppError {
-    fn from(error: sqlx::Error) -> Self {
-        Self::Database(error)
-    }
-}
-
-impl From<ValidationErrors> for AppError {
-    fn from(errors: ValidationErrors) -> Self {
-        Self::Validation(errors)
-    }
 }
 
 impl IntoResponse for AppError {
@@ -210,5 +218,22 @@ mod tests {
         assert_eq!(details.len(), 1);
         assert_eq!(details[0].field, "name");
         assert_eq!(details[0].message, "名称不能为空");
+    }
+
+    /// `Display` 与 `source` 改由 thiserror 派生后，必须保证「摘要对外、原因进 source」这条约束不变：
+    /// 数据库原因不能混进 `Display`，否则一旦被写进响应就是信息泄露。
+    #[test]
+    fn keeps_database_cause_out_of_display() {
+        let error = AppError::from(sqlx::Error::RowNotFound);
+
+        assert_eq!(error.to_string(), "数据库操作失败");
+        assert!(std::error::Error::source(&error).is_some(), "数据库原因必须挂在 source 上");
+    }
+
+    /// 携带自定义提示的变体，`Display` 就是该提示本身，便于启动期直接打印给人看。
+    #[test]
+    fn display_matches_variant_message() {
+        assert_eq!(AppError::NotFound("用户不存在").to_string(), "用户不存在");
+        assert_eq!(AppError::MethodNotAllowed.to_string(), "请求方法不被允许");
     }
 }

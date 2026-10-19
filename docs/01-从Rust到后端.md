@@ -38,15 +38,15 @@
 Rust 没有异常。错误是普通返回值，用 `?` 提前返回。
 
 ```rust
-// src/common/error.rs:63  ——  让 ? 能用的关键
-impl From<sqlx::Error> for AppError {
-    fn from(error: sqlx::Error) -> Self {
-        Self::Database(error)
-    }
+// src/common/error.rs:38  ——  让 ? 能用的关键
+pub enum AppError {
+    // ...
+    #[error("数据库操作失败")]
+    Database(#[from] sqlx::Error),
 }
 ```
 
-这三行的意义：任何返回 `Result<T, sqlx::Error>` 的函数，在本项目里都可以直接 `.await?`，因为 `sqlx::Error` 能自动转换成 `AppError`。于是在 Repository、Service、Handler 里，`?` 一路把错误往上抛，最后在**一个地方**统一变成 HTTP 响应（`impl IntoResponse for AppError`，`src/common/error.rs:75`）。
+`#[from]` 由 `thiserror` 展开成 `impl From<sqlx::Error> for AppError`。意义：任何返回 `Result<T, sqlx::Error>` 的函数，在本项目里都可以直接 `.await?`，因为 `sqlx::Error` 能自动转换成 `AppError`。于是在 Repository、Service、Handler 里，`?` 一路把错误往上抛，最后在**一个地方**统一变成 HTTP 响应（`impl IntoResponse for AppError`，`src/common/error.rs:83`）。
 
 对照一下心智差别：
 
@@ -72,22 +72,24 @@ pub(crate) async fn create_user(
 
 Handler 里没有任何错误分支——因为它不该在这里决定"用户名重复返回什么"。业务语义错误在 Service 里转换（`Conflict("用户名已存在")`），系统错误交给 `AppError::Database`，两者都由 `IntoResponse` 收口。
 
-> **自测**：如果把 `impl From<sqlx::Error> for AppError` 删掉，会有几处编译失败？先自己数，再用 `cargo build` 验证。
+> **自测**：如果把 `Database` 变体上的 `#[from]` 去掉，会有几处编译失败？先自己数，再用 `cargo build` 验证。
 
 ## 1.3 心智模型二：async 是"可暂停的普通函数"
 
 `async fn` 返回的是 `Future`，**不调用 `.await` 就一行都不执行**。这是 Rust 和其他语言异步模型最大的认知差异。
 
 ```rust
-// src/main.rs:15
+// src/main.rs:16
 #[tokio::main(worker_threads = 4)]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("server error: {error}");
+        eprintln!("server error: {error:?}");
         std::process::exit(1);
     }
 }
 ```
+
+`error` 的类型是 `anyhow::Error`，所以这里用 `{:?}` 而不是 `{}`：`Debug` 会把 `Caused by` 逐层展开成完整错误链，`Display` 只剩最外层一句（见[第 07 章](./07-统一响应与错误处理.md) 7.4 节）。
 
 `#[tokio::main]` 是一个宏，把 `main` 展开成：建运行时 → `block_on(run())`。`worker_threads = 4` 表示固定 4 个工作线程；一个 `Future` 被 `.await` 期间，线程可以去跑别的任务。
 
@@ -129,7 +131,7 @@ async fn verify_password(password: &str, encoded_hash: &str) -> Result<bool, App
 Rust 的 `enum` 可以带数据，这让"用类型让非法状态无法表示"变得便宜。本项目的三个典型例子：
 
 ```rust
-// src/common/error.rs:33  一个枚举表达全部错误类别
+// src/common/error.rs:38  一个枚举表达全部错误类别
 pub enum AppError {
     Validation(ValidationErrors),      // 带数据
     BadRequest(&'static str),          // 带数据

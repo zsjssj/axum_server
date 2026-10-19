@@ -406,6 +406,8 @@ bb8 在这里的作用不是「一个请求一条连接」，而是：
 
 把「连不上」和「命令写错」混成同一个字符串，排障时就无法判断该重试还是该改代码。
 
+变体的 `Display`、`source` 与 `From` 转换由 `thiserror` 在枚举上派生：只有 `Command` 与 `Serde` 带底层原因，`Config` 与 `Connection` 没有来源可追。把 `#[from]` 写在变体上，读枚举就能确认这个分布，不必再去另一个 `match` 里核对。
+
 ### 5.4 一个容易被忽略的细节：检出前 PING
 
 bb8 的 `ManageConnection::has_broken` 在 redis 的实现里**恒返回 `false`**，也就是说池子无法感知「连接已经断了」。所以本项目保留 `test_on_check_out` 的默认值：每次取连接前执行 `PING`，失败就丢弃重建。

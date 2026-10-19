@@ -25,6 +25,7 @@ use std::time::Duration;
 use bb8::Pool;
 use redis::{AsyncCommands, Client, RedisError, Script};
 use serde::{Serialize, de::DeserializeOwned};
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::config::RedisConfig;
@@ -41,39 +42,28 @@ pub type RedisPool = Pool<Client>;
 /// 区分「取连接失败」与「命令失败」：前者说明 Redis 不可达，通常应降级；
 /// 后者说明命令本身有问题（例如键类型不匹配、脚本报错），属于需要修复的缺陷。
 /// 把两者混成一个字符串会让排障时无法判断该重试还是该改代码。
-#[derive(Debug)]
+///
+/// 文案、`source` 与 `From` 转换统一由 `thiserror` 在变体上声明：手写 `Display` 加
+/// `source()` 的写法一旦新增变体就容易漏掉分支，把「哪些变体有底层原因」这件事
+/// 与变体定义放在同一处，才不会在扩展时退化。
+#[derive(Debug, Error)]
 pub enum RedisStoreError {
     /// 连接地址无法解析。
+    #[error("Redis 配置不合法：{0}")]
     Config(String),
     /// 从连接池取得连接失败：Redis 不可达、连接超时或连接创建被拒绝。
+    // 连接错误只保留原始描述：这里不需要区分具体失败原因，
+    // 调用方处理方式都是「降级并记录」。
+    #[error("Redis 连接不可用：{0}")]
     Connection(String),
     /// Redis 命令执行失败。
-    Command(RedisError),
+    // `#[from]` 同时生成了 `From<RedisError>`，因此调用处仍可直接用
+    // `map_err(RedisStoreError::Command)`，将来也可以用 `?` 自动转换。
+    #[error("Redis 命令执行失败：{0}")]
+    Command(#[from] RedisError),
     /// 缓存值的序列化或反序列化失败。属于程序缺陷，不是 Redis 故障。
-    Serde(serde_json::Error),
-}
-
-impl std::fmt::Display for RedisStoreError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Config(message) => write!(formatter, "Redis 配置不合法：{message}"),
-            // 连接错误只保留原始描述：这里不需要区分具体失败原因，
-            // 调用方处理方式都是「降级并记录」。
-            Self::Connection(message) => write!(formatter, "Redis 连接不可用：{message}"),
-            Self::Command(error) => write!(formatter, "Redis 命令执行失败：{error}"),
-            Self::Serde(error) => write!(formatter, "缓存值序列化失败：{error}"),
-        }
-    }
-}
-
-impl std::error::Error for RedisStoreError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Command(error) => Some(error),
-            Self::Serde(error) => Some(error),
-            Self::Config(_) | Self::Connection(_) => None,
-        }
-    }
+    #[error("缓存值序列化失败：{0}")]
+    Serde(#[from] serde_json::Error),
 }
 
 /// 统计滑动窗口内登录失败次数。
@@ -151,8 +141,7 @@ impl RedisStore {
     /// 必须在 Tokio 运行时内调用：bb8 创建连接池时会启动后台回收任务，
     /// 没有运行时就会 panic。因此构造本类型的单元测试要用 `#[tokio::test]`。
     pub fn from_config(config: &RedisConfig) -> Result<Self, RedisStoreError> {
-        let client = Client::open(config.url.clone())
-            .map_err(|error| RedisStoreError::Config(error.to_string()))?;
+        let client = Client::open(config.url.clone()).map_err(|error| RedisStoreError::Config(error.to_string()))?;
 
         let pool = Pool::builder()
             .max_size(config.pool_size)
@@ -174,28 +163,19 @@ impl RedisStore {
     /// 探测 Redis 是否可用。启动期与 `/ready` 就绪检查共用。
     pub async fn ping(&self) -> Result<(), RedisStoreError> {
         let mut connection = self.connection().await?;
-        let reply: String = redis::cmd("PING")
-            .query_async(&mut *connection)
-            .await
-            .map_err(RedisStoreError::Command)?;
+        let reply: String = redis::cmd("PING").query_async(&mut *connection).await.map_err(RedisStoreError::Command)?;
 
         // 服务器可能返回 `PONG` 以外的内容（例如被代理接管），
         // 只有明确的 `PONG` 才代表这就是目标 Redis。
         if reply == "PONG" {
             Ok(())
         } else {
-            Err(RedisStoreError::Connection(format!(
-                "PING 返回了非预期内容：{reply}"
-            )))
+            Err(RedisStoreError::Connection(format!("PING 返回了非预期内容：{reply}")))
         }
     }
 
     /// 统计滑动窗口内的登录失败次数。
-    pub async fn login_failure_count(
-        &self,
-        username: &str,
-        window: Duration,
-    ) -> Result<i64, RedisStoreError> {
+    pub async fn login_failure_count(&self, username: &str, window: Duration) -> Result<i64, RedisStoreError> {
         let key = self.login_failure_key(username);
         let mut connection = self.connection().await?;
 
@@ -209,11 +189,7 @@ impl RedisStore {
     }
 
     /// 记录一次登录失败，返回记录后窗口内的失败次数。
-    pub async fn record_login_failure(
-        &self,
-        username: &str,
-        window: Duration,
-    ) -> Result<i64, RedisStoreError> {
+    pub async fn record_login_failure(&self, username: &str, window: Duration) -> Result<i64, RedisStoreError> {
         let key = self.login_failure_key(username);
         // 成员用 UUIDv7：同一毫秒内的两次失败也不会互相覆盖。
         // 计数的精度依赖成员唯一，这里不能退化成「时间戳作为成员」。
@@ -236,11 +212,7 @@ impl RedisStore {
     /// 吊销记录不再有任何作用，让它随令牌一起消失可以避免键无限累积。
     /// 用 `SET ... EX` 单条命令写入，避免 `SET` 成功、`EXPIRE` 失败时
     /// 留下一个永不过期的键。
-    pub async fn revoke_access_token(
-        &self,
-        jti: &str,
-        ttl: Duration,
-    ) -> Result<(), RedisStoreError> {
+    pub async fn revoke_access_token(&self, jti: &str, ttl: Duration) -> Result<(), RedisStoreError> {
         let key = self.revoked_access_key(jti);
         let mut connection = self.connection().await?;
 
@@ -257,40 +229,24 @@ impl RedisStore {
 
         // 用 `EXISTS` 而不是 `GET`：吊销记录只关心「在不在」，
         // 读取内容没有任何意义，`EXISTS` 也不受值类型的影响。
-        let exists: i64 = connection
-            .exists(&key)
-            .await
-            .map_err(RedisStoreError::Command)?;
+        let exists: i64 = connection.exists(&key).await.map_err(RedisStoreError::Command)?;
 
         Ok(exists > 0)
     }
 
     /// 读取 JSON 缓存；键不存在时返回 `None`。
-    pub async fn get_json<T: DeserializeOwned>(
-        &self,
-        key: &str,
-    ) -> Result<Option<T>, RedisStoreError> {
+    pub async fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, RedisStoreError> {
         let mut connection = self.connection().await?;
-        let raw: Option<String> = connection
-            .get(key)
-            .await
-            .map_err(RedisStoreError::Command)?;
+        let raw: Option<String> = connection.get(key).await.map_err(RedisStoreError::Command)?;
 
         match raw {
-            Some(raw) => serde_json::from_str(&raw)
-                .map(Some)
-                .map_err(RedisStoreError::Serde),
+            Some(raw) => serde_json::from_str(&raw).map(Some).map_err(RedisStoreError::Serde),
             None => Ok(None),
         }
     }
 
     /// 写入 JSON 缓存，并设置过期时间。
-    pub async fn set_json<T: Serialize>(
-        &self,
-        key: &str,
-        value: &T,
-        ttl: Duration,
-    ) -> Result<(), RedisStoreError> {
+    pub async fn set_json<T: Serialize>(&self, key: &str, value: &T, ttl: Duration) -> Result<(), RedisStoreError> {
         let payload = serde_json::to_string(value).map_err(RedisStoreError::Serde)?;
         let mut connection = self.connection().await?;
 
@@ -304,10 +260,7 @@ impl RedisStore {
     pub async fn delete(&self, key: &str) -> Result<(), RedisStoreError> {
         let mut connection = self.connection().await?;
 
-        connection
-            .del::<_, ()>(key)
-            .await
-            .map_err(RedisStoreError::Command)
+        connection.del::<_, ()>(key).await.map_err(RedisStoreError::Command)
     }
 
     /// 登录失败计数键。
@@ -335,9 +288,7 @@ impl RedisStore {
         self.pool.get().await.map_err(|error| match error {
             // 连接创建失败本身已经带有可读的原因（例如连接被拒绝）。
             bb8::RunError::User(error) => RedisStoreError::Command(error),
-            bb8::RunError::TimedOut => {
-                RedisStoreError::Connection("等待连接池超时".to_owned())
-            }
+            bb8::RunError::TimedOut => RedisStoreError::Connection("等待连接池超时".to_owned()),
         })
     }
 }
@@ -449,10 +400,22 @@ mod tests {
         let connection_error = RedisStoreError::Connection("连接被拒绝".to_owned());
         assert!(connection_error.to_string().contains("连接不可用"));
 
-        let serde_error = RedisStoreError::Serde(
-            serde_json::from_str::<u32>("\"not-a-number\"").expect_err("类型不匹配应失败"),
-        );
+        let serde_error = RedisStoreError::Serde(serde_json::from_str::<u32>("\"not-a-number\"").expect_err("类型不匹配应失败"));
         assert!(serde_error.to_string().contains("序列化"));
+    }
+
+    /// `source` 的分布也是契约：只有包装了底层错误的变体才有来源可查，
+    /// 配置与连接错误保持 `None`，避免调用方误以为还能继续往下追。
+    #[test]
+    fn exposes_source_only_for_wrapped_errors() {
+        let serde_error = serde_json::from_str::<u32>("\"not-a-number\"").expect_err("类型不匹配应失败");
+
+        assert!(
+            std::error::Error::source(&RedisStoreError::Serde(serde_error)).is_some(),
+            "序列化错误必须保留 serde_json 的原始错误"
+        );
+        assert!(std::error::Error::source(&RedisStoreError::Config("bad".to_owned())).is_none());
+        assert!(std::error::Error::source(&RedisStoreError::Connection("down".to_owned())).is_none());
     }
 
     /// 连接地址写错时必须在创建阶段就报错，而不是等到第一次命令失败。
