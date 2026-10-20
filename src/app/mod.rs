@@ -231,11 +231,7 @@ mod tests {
         ] {
             let response = request(method.clone(), uri, Body::empty(), false).await;
 
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "{method} {uri} 未登录时必须返回 401"
-            );
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {uri} 未登录时必须返回 401");
             let body = json_body(response).await;
             assert_eq!(body["code"], 40100, "{method} {uri} 应返回未认证业务码");
             assert_eq!(body["message"], "未登录或登录已过期");
@@ -245,14 +241,7 @@ mod tests {
     /// 非法令牌与缺失令牌同样返回 401，不能因为解析失败而放行。
     #[tokio::test]
     async fn rejects_invalid_access_token() {
-        let response = dispatch(
-            Method::GET,
-            "/api/v1/hello",
-            Body::empty(),
-            false,
-            Some("not-a-jwt"),
-        )
-        .await;
+        let response = dispatch(Method::GET, "/api/v1/hello", Body::empty(), false, Some("not-a-jwt")).await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(json_body(response).await["code"], 40100);
@@ -323,13 +312,7 @@ mod tests {
     /// 「未登录或登录已过期」，就说明请求已进入 Handler 并走到了参数校验。
     #[tokio::test]
     async fn keeps_login_reachable_without_token() {
-        let response = request(
-            Method::POST,
-            "/api/v1/auth/login",
-            Body::from(json!({ "username": "ab" }).to_string()),
-            true,
-        )
-        .await;
+        let response = request(Method::POST, "/api/v1/auth/login", Body::from(json!({ "username": "ab" }).to_string()), true).await;
         let body = json_body(response).await;
 
         assert_eq!(body["code"], 40001, "登录接口应进入 Handler 并返回参数校验错误");

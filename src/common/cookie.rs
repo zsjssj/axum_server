@@ -23,7 +23,6 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
             // 其他 Cookie 中仍可能包含有效令牌。
             continue;
         };
-
         for cookie in cookie::Cookie::split_parse(raw.to_owned()).flatten() {
             if cookie.name() == name {
                 return Some(cookie.value().to_owned());
@@ -45,12 +44,7 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 ///
 /// 刻意不设置 `Domain`：省略时浏览器按"仅当前主机"处理，可避免令牌被发送到
 /// 同一父域下的其他子域。
-pub fn build_token_cookie(
-    config: &CookieConfig,
-    name: &str,
-    value: &str,
-    max_age_seconds: i64,
-) -> String {
+pub fn build_token_cookie(config: &CookieConfig, name: &str, value: &str, max_age_seconds: i64) -> String {
     Cookie::build((name.to_owned(), value.to_owned()))
         .path(config.path.clone())
         .http_only(true)
@@ -103,10 +97,7 @@ mod tests {
 
     fn headers_with_cookie(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            HeaderValue::from_str(value).expect("测试 Cookie 头应合法"),
-        );
+        headers.insert(axum::http::header::COOKIE, HeaderValue::from_str(value).expect("测试 Cookie 头应合法"));
         headers
     }
 
@@ -114,20 +105,14 @@ mod tests {
     fn parses_access_token_cookie() {
         let headers = headers_with_cookie("access_token=abc.def.ghi; other=1");
 
-        assert_eq!(
-            access_token_from_headers(&headers, &test_config()).as_deref(),
-            Some("abc.def.ghi")
-        );
+        assert_eq!(access_token_from_headers(&headers, &test_config()).as_deref(), Some("abc.def.ghi"));
     }
 
     #[test]
     fn parses_refresh_token_cookie() {
         let headers = headers_with_cookie("refresh_token=deadbeef");
 
-        assert_eq!(
-            refresh_token_from_headers(&headers, &test_config()).as_deref(),
-            Some("deadbeef")
-        );
+        assert_eq!(refresh_token_from_headers(&headers, &test_config()).as_deref(), Some("deadbeef"));
     }
 
     #[test]
@@ -148,19 +133,10 @@ mod tests {
     #[test]
     fn finds_token_across_multiple_cookie_headers() {
         let mut headers = HeaderMap::new();
-        headers.append(
-            axum::http::header::COOKIE,
-            HeaderValue::from_static("first=1"),
-        );
-        headers.append(
-            axum::http::header::COOKIE,
-            HeaderValue::from_static("access_token=found-me"),
-        );
+        headers.append(axum::http::header::COOKIE, HeaderValue::from_static("first=1"));
+        headers.append(axum::http::header::COOKIE, HeaderValue::from_static("access_token=found-me"));
 
-        assert_eq!(
-            access_token_from_headers(&headers, &test_config()).as_deref(),
-            Some("found-me")
-        );
+        assert_eq!(access_token_from_headers(&headers, &test_config()).as_deref(), Some("found-me"));
     }
 
     /// 名称前缀相同的 Cookie 不能被误匹配。
@@ -177,17 +153,11 @@ mod tests {
 
         assert!(cookie.starts_with("access_token=token-value"));
         assert!(cookie.contains("HttpOnly"), "必须设置 HttpOnly：{cookie}");
-        assert!(
-            cookie.contains("SameSite=Strict"),
-            "必须设置 SameSite：{cookie}"
-        );
+        assert!(cookie.contains("SameSite=Strict"), "必须设置 SameSite：{cookie}");
         assert!(cookie.contains("Max-Age=900"), "必须设置有效期：{cookie}");
         assert!(cookie.contains("Path=/"), "必须设置 Path：{cookie}");
         // 未启用 secure 时不应出现该属性，否则本地 HTTP 调试会失败。
-        assert!(
-            !cookie.contains("Secure"),
-            "未启用时不应设置 Secure：{cookie}"
-        );
+        assert!(!cookie.contains("Secure"), "未启用时不应设置 Secure：{cookie}");
     }
 
     /// secure 配置必须真正传递到 Cookie 属性上，
@@ -233,10 +203,7 @@ mod tests {
 
         let cookie = build_clear_cookie(&config, "refresh_token");
 
-        assert!(
-            cookie.contains("Secure"),
-            "清除时必须与下发属性一致：{cookie}"
-        );
+        assert!(cookie.contains("Secure"), "清除时必须与下发属性一致：{cookie}");
     }
 
     /// 令牌值不应被引号包裹，避免客户端拼接请求头时出现不一致。
@@ -244,9 +211,6 @@ mod tests {
     fn does_not_quote_token_value() {
         let cookie = build_token_cookie(&test_config(), "access_token", "plain-token", 60);
 
-        assert!(
-            !cookie.contains("\"plain-token\""),
-            "令牌值不应被引号包裹：{cookie}"
-        );
+        assert!(!cookie.contains("\"plain-token\""), "令牌值不应被引号包裹：{cookie}");
     }
 }

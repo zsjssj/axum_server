@@ -9,13 +9,12 @@ use axum::{
 };
 use std::time::{Duration, Instant};
 use tower_http::{
-    classify::{ServerErrorsAsFailures, SharedClassifier},
-    cors::{Any, CorsLayer},
-};
-
-use tower_http::{
     LatencyUnit,
     trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
+};
+use tower_http::{
+    classify::{ServerErrorsAsFailures, SharedClassifier},
+    cors::{Any, CorsLayer},
 };
 use tracing::Level;
 

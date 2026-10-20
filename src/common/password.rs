@@ -1,10 +1,6 @@
-use argon2::{
-    Argon2,
-    PasswordHasher,
-    // password_hash::{SaltString, rand_core::OsRng},
-};
-
 use crate::common::error::AppError;
+use argon2::{Argon2, PasswordHasher};
+// argon2::password_hash::{SaltString, rand_core::OsRng},
 
 /// 使用 Argon2 默认参数计算密码哈希。
 ///

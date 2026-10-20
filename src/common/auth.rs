@@ -25,17 +25,7 @@ use crate::modules::auth::service::AuthService;
 /// `/auth/login` 这样的相对路径。把前缀抽成常量，使「白名单写的是哪一段路径」
 /// 这件事在代码里有唯一定义，避免有人按完整路径写白名单后得到
 /// 「所有接口都要求登录」或「所有接口都放行」这类静默错误。
-const API_PREFIX: &str = "/api/v1";
-
-/// 认证通过后写入请求扩展的用户身份。
-///
-/// 只保存内部主键：`public_id`、用户名等资料由 Handler 按需查询，
-/// 避免中间件为了填充扩展而多做一次数据库查询。
-#[derive(Debug, Clone, Copy)]
-pub struct AuthUser {
-    pub user_id: i64,
-}
-
+pub const API_PREFIX: &str = "/api/v1";
 /// 登录接口路径，匿名可访问。
 pub const LOGIN_PATH: &str = "/auth/login";
 /// 刷新令牌接口路径，匿名可访问：access token 过期后只能凭刷新 Cookie 换取新令牌。
@@ -56,22 +46,13 @@ pub const LOGOUT_PATH: &str = "/auth/logout";
 /// 注册路由时使用上面这些常量拼接，就不会出现「路由改了、白名单没改」的偏差。
 const PUBLIC_PATHS: [&str; 3] = [LOGIN_PATH, REFRESH_PATH, LOGOUT_PATH];
 
-/// 登录校验中间件。
+/// 认证通过后写入请求扩展的用户身份。
 ///
-/// 白名单以外的请求必须携带有效的 `access_token` Cookie，否则直接返回 `401`，
-/// 不进入任何 Handler。校验通过后把用户身份写入请求扩展，供 `CurrentUser` 提取器读取。
-pub async fn require_login(State(state): State<AppState>, request: Request, next: Next) -> Result<Response, AppError> {
-    if is_public_path(request.uri().path()) {
-        return Ok(next.run(request).await);
-    }
-
-    let user = authenticate(&state, request.headers()).await?;
-
-    // 拆分请求后重新组装，唯一目的是在扩展中写入身份再交给后续处理链。
-    let (mut parts, body) = request.into_parts();
-    parts.extensions.insert(user);
-
-    Ok(next.run(Request::from_parts(parts, body)).await)
+/// 只保存内部主键：`public_id`、用户名等资料由 Handler 按需查询，
+/// 避免中间件为了填充扩展而多做一次数据库查询。
+#[derive(Debug, Clone, Copy)]
+pub struct AuthUser {
+    pub user_id: i64,
 }
 
 /// 判断请求路径是否属于匿名可访问的白名单。
@@ -82,7 +63,6 @@ pub async fn require_login(State(state): State<AppState>, request: Request, next
 /// 一旦将来出现同名子路由就会形成匿名入口。
 fn is_public_path(path: &str) -> bool {
     let relative_path = path.strip_prefix(API_PREFIX).unwrap_or(path);
-
     PUBLIC_PATHS.contains(&relative_path)
 }
 
@@ -98,9 +78,7 @@ fn is_public_path(path: &str) -> bool {
 /// 一次性踢下线更合理。
 async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Result<AuthUser, AppError> {
     let token = cookie::access_token_from_headers(headers, &state.auth.cookie).ok_or(AppError::Unauthorized("未登录或登录已过期"))?;
-
     let verified = AuthService::verify_access_token(&state.jwt, &token)?;
-
     match state.redis.is_access_token_revoked(&verified.jti).await {
         Ok(true) => {
             tracing::debug!(jti = %verified.jti, "access token 已在吊销列表中");
@@ -109,10 +87,22 @@ async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Resu
         Ok(false) => {}
         Err(error) => tracing::warn!(%error, "查询令牌吊销列表失败，按未吊销处理"),
     }
+    Ok(AuthUser { user_id: verified.user_id })
+}
 
-    Ok(AuthUser {
-        user_id: verified.user_id,
-    })
+/// 登录校验中间件。
+///
+/// 白名单以外的请求必须携带有效的 `access_token` Cookie，否则直接返回 `401`，
+/// 不进入任何 Handler。校验通过后把用户身份写入请求扩展，供 `CurrentUser` 提取器读取。
+pub async fn require_login(State(state): State<AppState>, request: Request, next: Next) -> Result<Response, AppError> {
+    if is_public_path(request.uri().path()) {
+        return Ok(next.run(request).await);
+    }
+    let user = authenticate(&state, request.headers()).await?;
+    // 拆分请求后重新组装，唯一目的是在扩展中写入身份再交给后续处理链。
+    let (mut parts, body) = request.into_parts();
+    parts.extensions.insert(user);
+    Ok(next.run(Request::from_parts(parts, body)).await)
 }
 
 #[cfg(test)]

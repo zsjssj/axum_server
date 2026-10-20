@@ -22,22 +22,13 @@ pub struct CurrentUser {
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &AppState) -> Result<Self, Self::Rejection> {
         // 扩展缺失说明该路由没有经过认证中间件。这种情况必须失败关闭而不是
         // 放行为匿名访问，否则一次路由改写就可能静默地把接口暴露出去。
-        parts
-            .extensions
-            .get::<AuthUser>()
-            .map(|user| Self {
-                user_id: user.user_id,
-            })
-            .ok_or_else(|| {
-                tracing::error!(uri = %parts.uri, "请求缺少认证中间件注入的用户身份");
-                AppError::Internal("认证上下文缺失")
-            })
+        parts.extensions.get::<AuthUser>().map(|user| Self { user_id: user.user_id }).ok_or_else(|| {
+            tracing::error!(uri = %parts.uri, "请求缺少认证中间件注入的用户身份");
+            AppError::Internal("认证上下文缺失")
+        })
     }
 }
 
@@ -75,10 +66,7 @@ mod tests {
     }
 
     fn parts() -> Parts {
-        let request = axum::http::Request::builder()
-            .uri("/api/v1/auth/me")
-            .body(())
-            .expect("测试请求应构造成功");
+        let request = axum::http::Request::builder().uri("/api/v1/auth/me").body(()).expect("测试请求应构造成功");
         let (parts, ()) = request.into_parts();
         parts
     }
@@ -89,9 +77,7 @@ mod tests {
         let mut parts = parts();
         parts.extensions.insert(AuthUser { user_id: 42 });
 
-        let user = CurrentUser::from_request_parts(&mut parts, &state)
-            .await
-            .expect("已注入身份的请求应提取成功");
+        let user = CurrentUser::from_request_parts(&mut parts, &state).await.expect("已注入身份的请求应提取成功");
 
         assert_eq!(user.user_id, 42);
     }

@@ -13,14 +13,13 @@
 //! 放在 `app` 层而不是模块层：它只做启动期装配，业务规则（字段校验、Argon2
 //! 哈希、唯一键冲突处理）全部由 `UserService` 承担，依赖方向仍然是`app → modules`。
 
-use sqlx::PgPool;
-use validator::Validate;
-
 use crate::common::error::AppError;
 use crate::config::BootstrapConfig;
 use crate::modules::user::model::CreateUserRequest;
 use crate::modules::user::repository::UserRepository;
 use crate::modules::user::service::UserService;
+use sqlx::PgPool;
+use validator::Validate;
 
 /// 按配置创建引导账号；未开启开关或已存在用户时直接返回成功。
 ///
@@ -30,7 +29,6 @@ pub async fn ensure_bootstrap_user(db: &PgPool, config: &BootstrapConfig) -> Res
     if !config.enabled {
         return Ok(());
     }
-
     // 以"表为空"作为唯一触发条件，而不是"该用户名不存在"：
     // 后者会让开关在每次启动时都尝试写库，等于留下一条绕过认证的建号通道。
     let existing = UserRepository::count(db).await?;
@@ -38,21 +36,18 @@ pub async fn ensure_bootstrap_user(db: &PgPool, config: &BootstrapConfig) -> Res
         tracing::info!(existing, "用户表非空，跳过引导账号创建");
         return Ok(());
     }
-
     let request = CreateUserRequest {
         username: config.username.clone(),
         email: config.email.clone(),
         password: config.password.clone(),
         nickname: config.nickname.clone(),
     };
-
     // 复用创建用户接口的校验规则，避免引导账号绕过用户名长度、邮箱格式和密码长度约束。
     // 失败详情只进日志：其中包含字段取值，不应出现在启动错误输出之外的地方。
     request.validate().map_err(|errors| {
         tracing::error!(?errors, "引导账号配置不合法，未能创建");
         AppError::Internal("引导账号配置不合法")
     })?;
-
     match UserService::create_user(db, request).await {
         Ok(user) => {
             tracing::warn!(

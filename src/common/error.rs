@@ -1,3 +1,4 @@
+use crate::common::response::{ApiCode, ApiResponse};
 use axum::{
     Json,
     http::StatusCode,
@@ -7,8 +8,6 @@ use serde::Serialize;
 use thiserror::Error;
 use utoipa::ToSchema;
 use validator::ValidationErrors;
-
-use crate::common::response::{ApiCode, ApiResponse};
 
 /// 参数校验失败时返回给客户端的单个字段错误。
 #[derive(Debug, Serialize, ToSchema)]
@@ -89,84 +88,28 @@ impl IntoResponse for AppError {
                 "请求参数校验失败",
                 validation_details(&errors),
             ),
-            Self::BadRequest(message) => (
-                StatusCode::BAD_REQUEST,
-                ApiCode::BadRequest,
-                message,
-                Vec::new(),
-            ),
-            Self::UnprocessableEntity(message) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                ApiCode::ValidationError,
-                message,
-                Vec::new(),
-            ),
-            Self::UnsupportedMediaType(message) => (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                ApiCode::UnsupportedMediaType,
-                message,
-                Vec::new(),
-            ),
-            Self::NotFound(message) => (
-                StatusCode::NOT_FOUND,
-                ApiCode::NotFound,
-                message,
-                Vec::new(),
-            ),
-            Self::MethodNotAllowed => (
-                StatusCode::METHOD_NOT_ALLOWED,
-                ApiCode::MethodNotAllowed,
-                "请求方法不被允许",
-                Vec::new(),
-            ),
-            Self::Unauthorized(message) => (
-                StatusCode::UNAUTHORIZED,
-                ApiCode::Unauthorized,
-                message,
-                Vec::new(),
-            ),
-            Self::TooManyRequests(message) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                ApiCode::TooManyRequests,
-                message,
-                Vec::new(),
-            ),
-            Self::ServiceUnavailable(message) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ApiCode::ServiceUnavailable,
-                message,
-                Vec::new(),
-            ),
-            Self::Conflict(message) => {
-                (StatusCode::CONFLICT, ApiCode::Conflict, message, Vec::new())
-            }
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, ApiCode::BadRequest, message, Vec::new()),
+            Self::UnprocessableEntity(message) => (StatusCode::UNPROCESSABLE_ENTITY, ApiCode::ValidationError, message, Vec::new()),
+            Self::UnsupportedMediaType(message) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, ApiCode::UnsupportedMediaType, message, Vec::new()),
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, ApiCode::NotFound, message, Vec::new()),
+            Self::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, ApiCode::MethodNotAllowed, "请求方法不被允许", Vec::new()),
+            Self::Unauthorized(message) => (StatusCode::UNAUTHORIZED, ApiCode::Unauthorized, message, Vec::new()),
+            Self::TooManyRequests(message) => (StatusCode::TOO_MANY_REQUESTS, ApiCode::TooManyRequests, message, Vec::new()),
+            Self::ServiceUnavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, ApiCode::ServiceUnavailable, message, Vec::new()),
+            Self::Conflict(message) => (StatusCode::CONFLICT, ApiCode::Conflict, message, Vec::new()),
             Self::Database(error) => {
                 tracing::error!(%error, "数据库操作失败");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ApiCode::InternalError,
-                    "服务器内部错误",
-                    Vec::new(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, ApiCode::InternalError, "服务器内部错误", Vec::new())
             }
             Self::Internal(message) => {
                 tracing::error!(%message, "内部操作失败");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ApiCode::InternalError,
-                    "服务器内部错误",
-                    Vec::new(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, ApiCode::InternalError, "服务器内部错误", Vec::new())
             }
         };
 
         (
             status,
-            Json(ApiResponse::error(
-                code,
-                message,
-                (!details.is_empty()).then_some(ErrorData { details }),
-            )),
+            Json(ApiResponse::error(code, message, (!details.is_empty()).then_some(ErrorData { details }))),
         )
             .into_response()
     }
@@ -178,16 +121,8 @@ fn validation_details(errors: &ValidationErrors) -> Vec<ErrorDetail> {
         .iter()
         .flat_map(|(field, errors)| {
             errors.iter().map(move |error| ErrorDetail {
-                field: if field == "__all__" {
-                    "_request".to_owned()
-                } else {
-                    field.to_string()
-                },
-                message: error
-                    .message
-                    .as_deref()
-                    .unwrap_or("字段值不合法")
-                    .to_owned(),
+                field: if field == "__all__" { "_request".to_owned() } else { field.to_string() },
+                message: error.message.as_deref().unwrap_or("字段值不合法").to_owned(),
             })
         })
         .collect::<Vec<_>>();
@@ -208,11 +143,7 @@ mod tests {
 
     #[test]
     fn converts_validation_errors_to_field_details() {
-        let errors = TestRequest {
-            name: String::new(),
-        }
-        .validate()
-        .expect_err("空名称应校验失败");
+        let errors = TestRequest { name: String::new() }.validate().expect_err("空名称应校验失败");
         let details = validation_details(&errors);
 
         assert_eq!(details.len(), 1);

@@ -1,16 +1,13 @@
-use axum::Router;
-use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
-
 use crate::app::routes::{HealthResponse, HelloResponse, ReadinessResponse, ServerInfoResponse};
 use crate::app::state::AppState;
 use crate::common::error::{ErrorData, ErrorDetail};
 use crate::common::pagination::PaginatedResponse;
 use crate::common::response::{ApiResponse, EmptyData};
-use crate::modules::auth::model::{
-    AuthSessionResponse, CookieNames, CurrentUserResponse, LoginRequest,
-};
+use crate::modules::auth::model::{AuthSessionResponse, CookieNames, CurrentUserResponse, LoginRequest};
 use crate::modules::user::model::{CreateUserRequest, UpdateUserRequest, User};
+use axum::Router;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 /// 服务 OpenAPI 文档定义
 #[derive(OpenApi)]
@@ -71,8 +68,7 @@ pub struct ApiDoc;
 
 /// 创建 OpenAPI JSON 与 Swagger UI 路由
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+    Router::new().merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
 }
 
 #[cfg(test)]
@@ -85,12 +81,7 @@ mod tests {
 
         assert!(document.paths.paths.contains_key("/health"));
         assert!(document.paths.paths.contains_key("/api/v1/users"));
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/v1/users/{public_id}")
-        );
+        assert!(document.paths.paths.contains_key("/api/v1/users/{public_id}"));
     }
 
     #[test]
@@ -108,15 +99,9 @@ mod tests {
     #[test]
     fn openapi_does_not_register_bearer_scheme() {
         let document = ApiDoc::openapi();
-        let security_schemes = document
-            .components
-            .map(|components| components.security_schemes)
-            .unwrap_or_default();
+        let security_schemes = document.components.map(|components| components.security_schemes).unwrap_or_default();
 
-        assert!(
-            !security_schemes.contains_key("bearer_auth"),
-            "Cookie 方案下不应存在 bearer_auth 安全方案"
-        );
+        assert!(!security_schemes.contains_key("bearer_auth"), "Cookie 方案下不应存在 bearer_auth 安全方案");
     }
 
     /// 受保护接口必须在文档中声明 `401`。
@@ -127,17 +112,8 @@ mod tests {
     fn openapi_declares_unauthorized_for_protected_routes() {
         let document = ApiDoc::openapi();
 
-        for path in [
-            "/api/v1/users",
-            "/api/v1/users/{public_id}",
-            "/api/v1/auth/me",
-            "/api/v1/hello",
-        ] {
-            let item = document
-                .paths
-                .paths
-                .get(path)
-                .unwrap_or_else(|| panic!("应注册路径 {path}"));
+        for path in ["/api/v1/users", "/api/v1/users/{public_id}", "/api/v1/auth/me", "/api/v1/hello"] {
+            let item = document.paths.paths.get(path).unwrap_or_else(|| panic!("应注册路径 {path}"));
             let operations = [
                 ("get", item.get.as_ref()),
                 ("post", item.post.as_ref()),
@@ -150,10 +126,7 @@ mod tests {
                 let Some(operation) = operation else { continue };
                 checked += 1;
 
-                assert!(
-                    operation.responses.responses.contains_key("401"),
-                    "{method} {path} 缺少 401 响应声明"
-                );
+                assert!(operation.responses.responses.contains_key("401"), "{method} {path} 缺少 401 响应声明");
             }
 
             assert!(checked > 0, "{path} 应至少声明一个方法");

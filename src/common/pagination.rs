@@ -4,6 +4,12 @@ use validator::Validate;
 
 const DEFAULT_PAGE: i64 = 1;
 const DEFAULT_PAGE_SIZE: i64 = 10;
+fn default_page() -> i64 {
+    DEFAULT_PAGE
+}
+fn default_page_size() -> i64 {
+    DEFAULT_PAGE_SIZE
+}
 
 #[derive(Debug, Deserialize, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
@@ -23,7 +29,6 @@ impl Pagination {
     pub fn page(&self) -> i64 {
         self.page
     }
-
     pub fn page_size(&self) -> i64 {
         self.page_size
     }
@@ -42,7 +47,6 @@ impl<T> PaginatedResponse<T> {
     pub fn new(items: Vec<T>, total: i64, pagination: &Pagination) -> Self {
         let page = pagination.page();
         let page_size = pagination.page_size();
-
         Self {
             items,
             total,
@@ -53,24 +57,13 @@ impl<T> PaginatedResponse<T> {
     }
 }
 
-fn default_page() -> i64 {
-    DEFAULT_PAGE
-}
-
-fn default_page_size() -> i64 {
-    DEFAULT_PAGE_SIZE
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn rejects_invalid_values() {
-        let pagination = Pagination {
-            page: 0,
-            page_size: 1_000,
-        };
+        let pagination = Pagination { page: 0, page_size: 1_000 };
 
         let errors = pagination.validate().expect_err("非法分页参数应校验失败");
 
@@ -80,10 +73,7 @@ mod tests {
 
     #[test]
     fn calculates_total_pages_without_floating_point() {
-        let pagination = Pagination {
-            page: 1,
-            page_size: 10,
-        };
+        let pagination = Pagination { page: 1, page_size: 10 };
         let response = PaginatedResponse::new(Vec::<()>::new(), 21, &pagination);
 
         assert_eq!(response.total_pages, 3);
