@@ -4,6 +4,10 @@ use crate::common::error::{ErrorData, ErrorDetail};
 use crate::common::pagination::PaginatedResponse;
 use crate::common::response::{ApiResponse, EmptyData};
 use crate::modules::auth::model::{AuthSessionResponse, CookieNames, CurrentUserResponse, LoginRequest};
+use crate::modules::information::model::{
+    AddMembersRequest, ConversationDetail, ConversationMember, ConversationSummary, CreateConversationRequest, Message,
+    MessagePage, ReadReceipt, SendMessageRequest,
+};
 use crate::modules::user::model::{CreateUserRequest, UpdateUserRequest, User};
 use axum::Router;
 use utoipa::OpenApi;
@@ -31,6 +35,15 @@ use utoipa_swagger_ui::SwaggerUi;
         crate::modules::user::handler::get_user,
         crate::modules::user::handler::update_user,
         crate::modules::user::handler::delete_user,
+        crate::modules::information::handler::create_conversation,
+        crate::modules::information::handler::list_conversations,
+        crate::modules::information::handler::get_conversation,
+        crate::modules::information::handler::send_message,
+        crate::modules::information::handler::list_messages,
+        crate::modules::information::handler::mark_read,
+        crate::modules::information::handler::recall_message,
+        crate::modules::information::handler::add_members,
+        crate::modules::information::handler::leave_conversation,
     ),
     components(schemas(
         ServerInfoResponse,
@@ -57,11 +70,27 @@ use utoipa_swagger_ui::SwaggerUi;
         ApiResponse<EmptyData>,
         ErrorDetail,
         ErrorData,
+        ConversationDetail,
+        ConversationSummary,
+        ConversationMember,
+        CreateConversationRequest,
+        Message,
+        MessagePage,
+        SendMessageRequest,
+        AddMembersRequest,
+        ReadReceipt,
+        ApiResponse<ConversationDetail>,
+        ApiResponse<ConversationSummary>,
+        ApiResponse<PaginatedResponse<ConversationSummary>>,
+        ApiResponse<Message>,
+        ApiResponse<MessagePage>,
+        ApiResponse<ReadReceipt>,
     )),
     tags(
         (name = "系统", description = "服务状态与示例接口"),
         (name = "认证", description = "登录、令牌刷新与登出"),
-        (name = "用户", description = "用户管理接口")
+        (name = "用户", description = "用户管理接口"),
+        (name = "聊天", description = "会话、消息与已读回执")
     )
 )]
 pub struct ApiDoc;
@@ -104,6 +133,27 @@ mod tests {
         assert!(!security_schemes.contains_key("bearer_auth"), "Cookie 方案下不应存在 bearer_auth 安全方案");
     }
 
+    /// 聊天模块的路由必须全部出现在文档里。
+    ///
+    /// 一起断言而不是逐个写：这些路径是同一组功能，漏注册任意一个都会让
+    /// Swagger 里缺一块，而测试逐条列出时最容易「新增接口忘了加断言」。
+    #[test]
+    fn openapi_contains_information_routes() {
+        let document = ApiDoc::openapi();
+
+        for path in [
+            "/api/v1/conversations",
+            "/api/v1/conversations/{public_id}",
+            "/api/v1/conversations/{public_id}/messages",
+            "/api/v1/conversations/{public_id}/read",
+            "/api/v1/conversations/{public_id}/members",
+            "/api/v1/conversations/{public_id}/members/me",
+            "/api/v1/messages/{public_id}/recall",
+        ] {
+            assert!(document.paths.paths.contains_key(path), "应注册聊天路径 {path}");
+        }
+    }
+
     /// 受保护接口必须在文档中声明 `401`。
     ///
     /// 认证由中间件统一强制，Handler 签名上看不出这一点，因此注解是调用方
@@ -112,7 +162,19 @@ mod tests {
     fn openapi_declares_unauthorized_for_protected_routes() {
         let document = ApiDoc::openapi();
 
-        for path in ["/api/v1/users", "/api/v1/users/{public_id}", "/api/v1/auth/me", "/api/v1/hello"] {
+        for path in [
+            "/api/v1/users",
+            "/api/v1/users/{public_id}",
+            "/api/v1/auth/me",
+            "/api/v1/hello",
+            "/api/v1/conversations",
+            "/api/v1/conversations/{public_id}",
+            "/api/v1/conversations/{public_id}/messages",
+            "/api/v1/conversations/{public_id}/read",
+            "/api/v1/conversations/{public_id}/members",
+            "/api/v1/conversations/{public_id}/members/me",
+            "/api/v1/messages/{public_id}/recall",
+        ] {
             let item = document.paths.paths.get(path).unwrap_or_else(|| panic!("应注册路径 {path}"));
             let operations = [
                 ("get", item.get.as_ref()),

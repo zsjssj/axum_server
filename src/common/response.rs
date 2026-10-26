@@ -60,6 +60,8 @@ pub enum ApiCode {
     UnsupportedMediaType = 40002,
     /// 未认证或凭证无效。
     Unauthorized = 40100,
+    /// 已认证但无权执行该操作（如普通成员尝试管理群成员）。
+    Forbidden = 40300,
     /// 请求的资源或接口不存在。
     NotFound = 40400,
     /// 请求方法对该接口不被允许。

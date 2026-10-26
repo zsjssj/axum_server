@@ -19,16 +19,14 @@
 //! | access token 吊销列表 | STRING | TTL 等于令牌剩余有效期，到期即自动清理 |
 //! | 用户资料缓存 | STRING（JSON） | 固定 TTL + 写操作主动删除 |
 
-use std::sync::LazyLock;
-use std::time::Duration;
-
+use crate::config::RedisConfig;
 use bb8::Pool;
 use redis::{AsyncCommands, Client, RedisError, Script};
 use serde::{Serialize, de::DeserializeOwned};
+use std::sync::LazyLock;
+use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
-
-use crate::config::RedisConfig;
 
 /// Redis 连接池。
 ///
@@ -77,6 +75,7 @@ pub enum RedisStoreError {
 ///
 /// `KEYS[1]` 是统计键，`ARGV[1]` 是当前时间（毫秒），`ARGV[2]` 是窗口长度（毫秒）。
 static LOGIN_FAILURE_COUNT_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
+    // 构造一个 Redis Script 对象，内部把 Lua 源码注册/缓存起来
     Script::new(
         r#"
         local key = KEYS[1]
@@ -142,8 +141,8 @@ impl RedisStore {
     /// 没有运行时就会 panic。因此构造本类型的单元测试要用 `#[tokio::test]`。
     pub fn from_config(config: &RedisConfig) -> Result<Self, RedisStoreError> {
         let client = Client::open(config.url.clone()).map_err(|error| RedisStoreError::Config(error.to_string()))?;
-
-        let pool = Pool::builder()
+        // 因为前面 type RedisPool = Pool<Client>; 所以此处 RedisPool::builder()等效于 Pool::builder()，
+        let pool = RedisPool::builder()
             .max_size(config.pool_size)
             .connection_timeout(Duration::from_secs(5))
             .build_unchecked(client);
@@ -300,12 +299,10 @@ impl RedisStore {
 fn normalize_prefix(prefix: &str) -> String {
     prefix.trim().trim_matches(':').to_owned()
 }
-
 /// 当前时间的毫秒时间戳。
 fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
-
 /// 把时长转换为毫秒，并保证至少为 1：窗口为 0 会让所有成员立即过期，
 /// 相当于关闭限流，属于配置错误而不是有效取值。
 fn window_millis(window: Duration) -> i64 {

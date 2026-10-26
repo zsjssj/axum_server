@@ -2,7 +2,7 @@
 
 这是一套**按学习顺序**编排的教程，目标不是"介绍这个项目用到了什么"，而是带你从零理解 **一个 Rust 后端是怎样被想出来、拆开、写出来、再守住的**。所有讲解都对照本仓库的真实代码，你可以边读边打开对应文件。
 
-- 想直接查某个接口怎么调 → 看 [`reference/AUTH_API.md`](./reference/AUTH_API.md)、[`reference/USER_API.md`](./reference/USER_API.md)
+- 想直接查某个接口怎么调 → 看 [`reference/AUTH_API.md`](./reference/AUTH_API.md)、[`reference/USER_API.md`](./reference/USER_API.md)、[`reference/INFORMATION_API.md`](./reference/INFORMATION_API.md)
 - 想查架构总览与设计清单 → 看 [`reference/ARCHITECTURE.md`](./reference/ARCHITECTURE.md)
 - 想深入 Redis → 看 [`reference/REDIS_GUIDE.md`](./reference/REDIS_GUIDE.md)
 - **想学会写 Rust 后端 → 从下面第 01 章顺着读**
@@ -65,9 +65,10 @@
 
 参考手册（不对应学习顺序，按需查阅）：
 
-- [reference/ARCHITECTURE.md](./reference/ARCHITECTURE.md)：架构、启动流程、认证设计、错误码、扩展方式
+- [reference/ARCHITECTURE.md](./reference/ARCHITECTURE.md)：架构、启动流程、认证设计、错误码、扩展方式、聊天模块设计
 - [reference/AUTH_API.md](./reference/AUTH_API.md)：认证接口、令牌语义、客户端约束、配置表
 - [reference/USER_API.md](./reference/USER_API.md)：用户接口、校验规则、业务码
+- [reference/INFORMATION_API.md](./reference/INFORMATION_API.md)：聊天接口（会话/消息/已读/撤回）、幂等发送、权限与错误码
 - [reference/REDIS_GUIDE.md](./reference/REDIS_GUIDE.md)：Redis 概念、五种数据类型、Lua、五个实验、排错
 
 ## 4. 先把环境跑起来
@@ -153,7 +154,7 @@ cargo clippy --all-targets   # 静态检查
 cargo test             # 单元测试 + 集成测试（不需要真实数据库）
 ```
 
-`cargo test` 应输出 **100 passed**，且不依赖数据库或 Redis。
+`cargo test` 应输出 **129 passed**，且不依赖数据库或 Redis。
 
 > **关于 `cargo fmt --check`**：`rustfmt.toml` 里启用了一些 nightly-only 选项（`wrap_comments`、`trailing_comma`、`format_strings` 等），stable 工具链会忽略它们并给出警告；因此在 stable 下 `cargo fmt --check` 会报出约 120 处"应当合并成一行"的差异。这属于仓库既有的工具链差异，**不影响编译和测试**。实用做法是本地改完代码跑一次 `cargo fmt`，并以 `cargo clippy --all-targets` 和 `cargo test` 作为真正的门禁；若要严格卡格式，需要在 CI 里固定工具链并使用 nightly 的 rustfmt。
 
@@ -181,6 +182,7 @@ cargo test             # 单元测试 + 集成测试（不需要真实数据库�
 | `src/infrastructure/redis.rs` | Redis 适配层（键、脚本、缓存原语） | 10 |
 | `src/modules/user/*` | 用户模块：model/repository/service/handler | 04、05、06 |
 | `src/modules/auth/*` | 认证模块：登录、刷新、登出、当前用户 | 09 |
+| `src/modules/information/*` | 聊天消息模块：会话、成员、消息、已读回执、撤回 | 04、06、07、13 |
 | `migrations/*.sql` | 数据库结构演进 | 04 |
 | `config/*.toml` | 分层配置 | 03 |
 

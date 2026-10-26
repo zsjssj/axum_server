@@ -317,4 +317,93 @@ mod tests {
 
         assert_eq!(body["code"], 40001, "登录接口应进入 Handler 并返回参数校验错误");
     }
+
+    /// 聊天接口同样受认证中间件保护。
+    ///
+    /// 这一组接口没有额外的认证声明，完全依赖挂在 `/api/v1` 上的中间件；
+    /// 用例把它们逐条覆盖，防止将来有人把路由挪出受保护的路由组。
+    #[tokio::test]
+    async fn rejects_anonymous_information_requests() {
+        // 会话与消息都用同一个合法的 UUIDv7，确保被拦截的原因是「未登录」
+        // 而不是路径参数解析失败。
+        let conversation_id = "0192f7c6-1a2b-7000-8000-000000000001";
+
+        for (method, uri) in [
+            (Method::GET, "/api/v1/conversations".to_owned()),
+            (Method::POST, "/api/v1/conversations".to_owned()),
+            (Method::GET, format!("/api/v1/conversations/{conversation_id}")),
+            (Method::GET, format!("/api/v1/conversations/{conversation_id}/messages")),
+            (Method::POST, format!("/api/v1/conversations/{conversation_id}/messages")),
+            (Method::POST, format!("/api/v1/conversations/{conversation_id}/read")),
+            (Method::POST, format!("/api/v1/conversations/{conversation_id}/members")),
+            (Method::DELETE, format!("/api/v1/conversations/{conversation_id}/members/me")),
+            (Method::POST, format!("/api/v1/messages/{conversation_id}/recall")),
+        ] {
+            let response = request(method.clone(), &uri, Body::empty(), false).await;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {uri} 未登录时必须返回 401");
+            assert_eq!(json_body(response).await["code"], 40100, "{method} {uri} 应返回未认证业务码");
+        }
+    }
+
+    /// 会话创建参数在进入 Service 之前就完成校验，因此不需要真实数据库。
+    ///
+    /// 单聊只能指定一个成员：这是最容易漏掉的一条，因为「多传几个」既不报错
+    /// 也不违反数据库约束，只会让语义变得含糊。
+    #[tokio::test]
+    async fn rejects_invalid_create_conversation_request() {
+        let response = request_as_logged_in_user(
+            Method::POST,
+            "/api/v1/conversations",
+            Body::from(
+                json!({
+                    "kind": "single",
+                    "member_public_ids": [
+                        "0192f7c6-1a2b-7000-8000-000000000001",
+                        "0192f7c6-1a2b-7000-8000-000000000002"
+                    ]
+                })
+                .to_string(),
+            ),
+            true,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json_body(response).await["code"], 40001);
+    }
+
+    /// 未知的会话类型必须被拒绝，而不是落库成一个谁都不认识的 `kind`。
+    ///
+    /// 这里断言的是反序列化阶段的失败：`ConversationKind` 是枚举，
+    /// 非法取值连 Service 都进不去。
+    #[tokio::test]
+    async fn rejects_unknown_conversation_kind() {
+        let response = request_as_logged_in_user(
+            Method::POST,
+            "/api/v1/conversations",
+            Body::from(
+                json!({
+                    "kind": "broadcast",
+                    "member_public_ids": ["0192f7c6-1a2b-7000-8000-000000000001"]
+                })
+                .to_string(),
+            ),
+            true,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json_body(response).await["code"], 40001);
+    }
+
+    /// 已登录时请求能穿过中间件并进入聊天业务层。
+    ///
+    /// 用例环境没有真实数据库，因此断言「不再是未认证错误」而不是断言 200。
+    #[tokio::test]
+    async fn lets_authenticated_request_reach_information_handler() {
+        let response = request_as_logged_in_user(Method::GET, "/api/v1/conversations", Body::empty(), false).await;
+
+        assert_ne!(json_body(response).await["code"], 40100, "合法令牌不应被认证中间件拒绝");
+    }
 }

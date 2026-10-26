@@ -40,7 +40,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tower-http = { version = "0.5", features = ["cors","trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-utoipa = { version = "5.5.0", features = ["uuid"] }
+# chrono 特性让 `chrono::DateTime<Tz>` 直接生成字符串类型的 OpenAPI Schema，
+# 聊天模块的时间字段因此不必逐个手写 `#[schema(value_type = String)]`。
+utoipa = { version = "5.5.0", features = ["uuid", "chrono"] }
 utoipa-swagger-ui = { version = "8", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 validator = { version = "0.20", features = ["derive"] }

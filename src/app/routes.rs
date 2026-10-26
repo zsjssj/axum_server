@@ -4,7 +4,7 @@ use crate::common::{
     error::{AppError, ErrorData},
     response::ApiResponse,
 };
-use crate::modules::{auth, user};
+use crate::modules::{auth, information, user};
 use axum::{
     Router,
     extract::State,
@@ -36,6 +36,7 @@ pub fn api_routes(state: AppState) -> Router<AppState> {
         .route("/hello", get(hello_handler))
         .merge(auth::routes())
         .merge(user::routes())
+        .merge(information::routes())
         // 用 `route_layer` 而不是 `layer`：它明确只作用于已匹配到路由的请求，
         // 中间件不会因为被降到外层 fallback 而误判不存在的路径。
         .route_layer(axum::middleware::from_fn_with_state(state, crate::common::auth::require_login));

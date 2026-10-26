@@ -53,6 +53,14 @@ pub enum AppError {
     /// 请求方法不被路由允许，对应 `405` 与业务码 `40500`，提示语固定无需携带内容。
     #[error("请求方法不被允许")]
     MethodNotAllowed,
+    /// 已认证但无权执行该操作，对应 `403` 与业务码 `40300`。
+    ///
+    /// 与 `NotFound` 的分工按「会泄露什么」判断：当资源本身的存在与否属于隐私
+    /// （例如别人的会话、别人的聊天记录），必须返回 `404`——`403` 等于告诉对方
+    /// 「这条记录存在，只是不属于你」，顺手提供了一个探测接口。只有调用方本来
+    /// 就能看见的资源上才用 `403`，例如群成员可以看见群，但没有「添加成员」权限。
+    #[error("{0}")]
+    Forbidden(&'static str),
     /// 未认证或凭证无效，对应 `401` 与业务码 `40100`。
     ///
     /// 登录失败统一使用该变体且提示语保持一致，避免通过响应差异区分
@@ -93,6 +101,7 @@ impl IntoResponse for AppError {
             Self::UnsupportedMediaType(message) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, ApiCode::UnsupportedMediaType, message, Vec::new()),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, ApiCode::NotFound, message, Vec::new()),
             Self::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, ApiCode::MethodNotAllowed, "请求方法不被允许", Vec::new()),
+            Self::Forbidden(message) => (StatusCode::FORBIDDEN, ApiCode::Forbidden, message, Vec::new()),
             Self::Unauthorized(message) => (StatusCode::UNAUTHORIZED, ApiCode::Unauthorized, message, Vec::new()),
             Self::TooManyRequests(message) => (StatusCode::TOO_MANY_REQUESTS, ApiCode::TooManyRequests, message, Vec::new()),
             Self::ServiceUnavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, ApiCode::ServiceUnavailable, message, Vec::new()),

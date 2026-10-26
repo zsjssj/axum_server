@@ -13,12 +13,9 @@ max_connections = 10
 # 本地启动：docker run --rm -p 6379:6379 redis:latest
 [redis]
 url = "redis://127.0.0.1:6379"
-# 连接池上限：Redis 一条多路复用连接即可承载并发，这里限制的是突发连接数。
-pool_size = 8
-# 键命名空间：多环境共用一个实例时必须区分，避免相互覆盖。
-key_prefix = "axum"
-# 用户详情缓存 TTL（秒）。写入路径会主动删缓存，这里只是最后一道兜底。
-user_cache_ttl_seconds = 60
+pool_size = 8 # 连接池上限：Redis 一条多路复用连接即可承载并发，这里限制的是突发连接数。
+key_prefix = "axum" # 键命名空间：多环境共用一个实例时必须区分，避免相互覆盖。
+user_cache_ttl_seconds = 60 # 用户详情缓存 TTL（秒）。写入路径会主动删缓存，这里只是最后一道兜底。
 
 [log]
 level = "info"
@@ -36,7 +33,6 @@ refresh_ttl_days = 7
 [auth]
 max_login_failures = 5
 login_window_minutes = 15
-
 # 令牌 Cookie 配置。
 # secure = false 仅适用于本地 HTTP 调试；生产环境必须改为 true，
 # 否则令牌会在明文 HTTP 中传输并可能被中间人截获。

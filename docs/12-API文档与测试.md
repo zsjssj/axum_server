@@ -162,18 +162,20 @@ src/**/mod.rs 里的 #[cfg(test)] mod tests   ← 单元测试（绝大多数）
 src/app/mod.rs 里的集成式测试                ← 走完整 Router，但不连真实数据库/Redis
 ```
 
-当前共 **100 个测试**，分布大致是：
+当前共 **129 个测试**，分布大致是：
 
 | 文件 | 数量 | 测什么 |
 | --- | ---: | --- |
+| `modules/information/model.rs` | 18 | 会话/消息校验、撤回必须清空正文、游标参数边界 |
 | `modules/auth/service.rs` | 16 | JWT 签发/校验/过期/类型、重放、哈希 |
 | `config/mod.rs` | 14 | 各类非法配置必须被拒 |
-| `app/mod.rs` | 13 | 路由、认证中间件、信封、404/405 |
+| `app/mod.rs` | 17 | 路由、认证中间件、信封、404/405 |
 | `common/cookie.rs` | 12 | Cookie 解析与安全属性 |
 | `common/auth.rs` | 8 | 白名单、路径匹配、身份传递 |
-| `infrastructure/redis.rs` | 7 | 键命名空间、前缀规范化、错误分类 |
+| `infrastructure/redis.rs` | 8 | 键命名空间、前缀规范化、错误分类 |
 | `modules/auth/model.rs` / `handler.rs` | 5 + 5 | 登录模型、Cookie 下发/清除 |
-| 其余 | 20 | 分页、密码、提取器、引导账号等 |
+| `modules/information/service.rs` | 3 | 单聊唯一键的方向无关性与无碰撞 |
+| 其余 | 23 | 分页、密码、提取器、引导账号、OpenAPI 注册、聊天路由保护等 |
 
 这个分布很说明问题：**测试集中在"安全约束"和"输入边界"上**，而不是追求覆盖率数字。这是正确的优先级——认证、配置校验、Cookie 属性的 bug，代价远高于一个 CRUD 方法的分支未覆盖。
 

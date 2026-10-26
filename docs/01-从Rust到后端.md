@@ -175,6 +175,7 @@ src/
 ├── infrastructure/      外部依赖适配：PostgreSQL、Redis
 └── modules/             业务模块
     ├── auth/            mod.rs / handler / service / repository / model
+    ├── information/     mod.rs / handler / service / repository / model（聊天消息）
     └── user/            mod.rs / handler / service / repository / model
 ```
 
