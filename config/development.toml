@@ -1,10 +1,41 @@
 [server]
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 3000
 
 [database]
-url = "postgresql://postgres:postgres@localhost:5432/postgres"
-max_connections = 5
+url = "postgresql://postgres:123456@localhost:5432/axum_db"
+max_connections = 10
+
+[redis]
+url = "redis://127.0.0.1:6379"
+pool_size = 8 # 连接池上限：Redis 一条多路复用连接即可承载并发，这里限制的是突发连接数。
+key_prefix = "axum" # 键命名空间：多环境共用一个实例时必须区分，避免相互覆盖。
+user_cache_ttl_seconds = 60 # 用户详情缓存 TTL（秒）。写入路径会主动删缓存，这里只是最后一道兜底。
 
 [log]
-level = "debug"
+level = "info"
+
+[jwt]
+secret = "dev-only-insecure-secret-change-me-32chars"
+issuer = "rust-axum-server"
+access_ttl_minutes = 15
+refresh_ttl_days = 7
+
+
+[auth]
+max_login_failures = 5
+login_window_minutes = 15
+
+[auth.cookie]
+access_name = "access_token"
+refresh_name = "refresh_token"
+secure = false
+same_site = "strict"
+path = "/"
+
+[bootstrap]
+enabled = true
+username = "ssje"
+email = "2114714800@qq.com"
+password = "ssje123456"
+

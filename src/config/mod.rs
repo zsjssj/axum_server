@@ -107,11 +107,7 @@ impl CookieConfig {
     ///
     /// 取值不合法时回退到最严格的 `Strict`，避免配置写错导致防护被静默放宽。
     pub fn same_site_attribute(&self) -> &'static str {
-        if self.same_site.eq_ignore_ascii_case("lax") {
-            "Lax"
-        } else {
-            "Strict"
-        }
+        if self.same_site.eq_ignore_ascii_case("lax") { "Lax" } else { "Strict" }
     }
 }
 
@@ -149,7 +145,6 @@ impl AppConfig {
     pub fn new() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok(); // 加载 .env 文件（如果存在）
         let run_mode: String = env::var("RUN_MODE").unwrap_or_else(|_| "development".into()); // 获取运行环境，默认为 development
-
         let config: Config = Config::builder()
             // 加载默认配置
             .add_source(File::with_name("config/default"))
@@ -160,7 +155,6 @@ impl AppConfig {
             // 环境变量覆盖（使用 APP_ 前缀）
             .add_source(Environment::with_prefix("APP").separator("__"))
             .build()?;
-
         config.try_deserialize()
     }
 
@@ -174,42 +168,28 @@ impl AppConfig {
     /// 攻击者可以离线伪造任意用户的令牌，运行期再发现已经太晚。
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.jwt.secret.len() < MIN_JWT_SECRET_LENGTH {
-            return Err(ConfigError::Message(format!(
-                "JWT 密钥长度不得少于 {MIN_JWT_SECRET_LENGTH} 个字符"
-            )));
+            return Err(ConfigError::Message(format!("JWT 密钥长度不得少于 {MIN_JWT_SECRET_LENGTH} 个字符")));
         }
         if self.jwt.access_ttl_minutes <= 0 || self.jwt.refresh_ttl_days <= 0 {
             return Err(ConfigError::Message("JWT 有效期必须为正数".to_owned()));
         }
         if self.auth.max_login_failures <= 0 || self.auth.login_window_minutes <= 0 {
-            return Err(ConfigError::Message(
-                "登录保护的失败次数与统计窗口必须为正数".to_owned(),
-            ));
+            return Err(ConfigError::Message("登录保护的失败次数与统计窗口必须为正数".to_owned()));
         }
-        if self.auth.cookie.access_name.trim().is_empty()
-            || self.auth.cookie.refresh_name.trim().is_empty()
-        {
+        if self.auth.cookie.access_name.trim().is_empty() || self.auth.cookie.refresh_name.trim().is_empty() {
             return Err(ConfigError::Message("Cookie 名称不能为空".to_owned()));
         }
         if self.auth.cookie.access_name == self.auth.cookie.refresh_name {
-            return Err(ConfigError::Message(
-                "access token 与 refresh token 的 Cookie 名称不能相同".to_owned(),
-            ));
+            return Err(ConfigError::Message("access token 与 refresh token 的 Cookie 名称不能相同".to_owned()));
         }
         // Redis 是可选加速组件，但一旦配置了就应当是可用配置：
         // 地址写成拼写错误时，运行期所有 Redis 功能都会静默降级为「未启用」，
         // 排障时极难联想到是配置写错。这里在启动阶段直接拒绝明显非法的取值。
-        if self.redis.url.trim().is_empty()
-            || !(self.redis.url.starts_with("redis://") || self.redis.url.starts_with("rediss://"))
-        {
-            return Err(ConfigError::Message(
-                "redis.url 必须以 redis:// 或 rediss:// 开头".to_owned(),
-            ));
+        if self.redis.url.trim().is_empty() || !(self.redis.url.starts_with("redis://") || self.redis.url.starts_with("rediss://")) {
+            return Err(ConfigError::Message("redis.url 必须以 redis:// 或 rediss:// 开头".to_owned()));
         }
         if self.redis.pool_size == 0 {
-            return Err(ConfigError::Message(
-                "redis.pool_size 必须大于 0".to_owned(),
-            ));
+            return Err(ConfigError::Message("redis.pool_size 必须大于 0".to_owned()));
         }
         if self.redis.key_prefix.trim().is_empty() {
             return Err(ConfigError::Message(
@@ -217,9 +197,7 @@ impl AppConfig {
             ));
         }
         if self.redis.user_cache_ttl_seconds <= 0 {
-            return Err(ConfigError::Message(
-                "redis.user_cache_ttl_seconds 必须为正数".to_owned(),
-            ));
+            return Err(ConfigError::Message("redis.user_cache_ttl_seconds 必须为正数".to_owned()));
         }
         // 启用引导账号却缺少必要字段，会在服务已经启动之后才暴露为「无人能登录」。
         // 这里只做非空检查，长度、邮箱格式等细则由创建用户请求模型的校验统一负责，
@@ -255,9 +233,7 @@ mod tests {
                 url: "postgresql://localhost:5432/postgres".to_owned(),
                 max_connections: 5,
             },
-            log: LogConfig {
-                level: "info".to_owned(),
-            },
+            log: LogConfig { level: "info".to_owned() },
             redis: RedisConfig {
                 url: "redis://127.0.0.1:6379".to_owned(),
                 pool_size: 8,
@@ -326,10 +302,7 @@ mod tests {
         let mut config = valid_config();
         config.auth.cookie.refresh_name = config.auth.cookie.access_name.clone();
 
-        assert!(
-            config.validate().is_err(),
-            "两个令牌共用同一 Cookie 名称会互相覆盖，必须被拒绝"
-        );
+        assert!(config.validate().is_err(), "两个令牌共用同一 Cookie 名称会互相覆盖，必须被拒绝");
     }
 
     #[test]
@@ -387,11 +360,7 @@ mod tests {
         assert_eq!(config.auth.cookie.same_site_attribute(), "Lax");
 
         config.auth.cookie.same_site = "None".to_owned();
-        assert_eq!(
-            config.auth.cookie.same_site_attribute(),
-            "Strict",
-            "未知取值应回退到 Strict"
-        );
+        assert_eq!(config.auth.cookie.same_site_attribute(), "Strict", "未知取值应回退到 Strict");
     }
 
     /// 引导账号默认必须关闭：默认值一旦变成 `true`，任何一次误部署都会
