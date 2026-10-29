@@ -3,11 +3,13 @@ CREATE TABLE IF NOT EXISTS users (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     public_id UUID NOT NULL UNIQUE,
     username VARCHAR(50) NOT NULL UNIQUE,
-    email VARCHAR(100) NOT NULL,
+    email VARCHAR(100) NOT NULL UNIQUE,
     nickname VARCHAR(100),
     password_hash VARCHAR(255) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    is_disabled BOOLEAN NOT NULL DEFAULT FALSE,
+    disabled_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 -- 创建索引,以email字段创建的索引

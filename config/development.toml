@@ -33,7 +33,7 @@ same_site = "strict"
 path = "/"
 
 [bootstrap]
-enabled = true
+enabled = false
 username = "ssje"
 email = "2114714800@qq.com"
 password = "ssje123456"
