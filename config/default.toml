@@ -1,48 +1,86 @@
+# 默认配置：所有环境共享的最低一层，会被 config/{RUN_MODE}.toml、
+# config/local.toml（不提交）以及 APP__* 环境变量逐层覆盖（后加载者生效）。
+#
+# 注意事项：
+# 1. 本文件会提交到仓库，因此所有取值都只是「能跑起来的占位值」，
+#    任何密钥、口令类配置都不得写入真实值（见 [jwt] 与 [bootstrap] 的说明）。
+# 2. 修改键名或删改字段会直接导致启动失败：AppConfig 使用强类型反序列化
+#    （src/config/mod.rs），缺失必填字段没有运行时兜底。
+# 3. 与安全相关的取值（密钥长度、Cookie 属性、Redis 地址格式等）会在启动时
+#    由 AppConfig::validate() 校验，非法配置在监听端口之前就被拒绝。
+
+# HTTP 服务监听配置。
 [server]
+# 监听地址。0.0.0.0 表示监听本机全部 IPv4 网卡，因此容器外/局域网可直接访问；
+# 只允许本机访问时应改为 127.0.0.1。若前置了反向代理，通常保持 0.0.0.0 并
+# 由代理负责 TLS 与来源控制。
 host = "0.0.0.0"
+# 监听端口（u16，取值 1-65535）。端口被占用是最常见的启动失败原因，
+# 报错信息里会带上完整地址，便于直接定位到本项。
 port = 3000
 
+# PostgreSQL 连接配置。
 [database]
+# 连接串，格式为 postgresql://用户:口令@主机:端口/库名。
+# 注释掉的一行是不带库名与口令的最简写法，仅用于本地快速验证连通性。
 # url = "postgres://127.0.0.1:5432/postgres"
+# 生产环境应通过 APP__DATABASE__URL 注入，避免口令进入版本控制。
 url = "postgresql://postgres:postgres@localhost:5432/postgres"
+# 连接池上限（sqlx 每实例独立维护）。该值是「单实例」配额，
+# 多副本部署时需保证 副本数 × 本值 < PostgreSQL 的 max_connections，
+# 否则高并发下会因服务端连接耗尽而报错。
 max_connections = 10
+
+# 日志配置。
+[log]
+# 日志过滤级别，语法为 tracing 的 EnvFilter 指令，而非单一枚举值。
+# 可写全局级别（trace/debug/info/warn/error），也可按模块单独降噪，
+# 例如 "info,sqlx=warn,axum=debug"。
+# 写错时的兜底是回退到 info，不会导致启动失败，因此排障时要注意确认本项是否生效。
+level = "info"
 
 # Redis 配置：登录失败计数、access token 吊销列表与用户资料缓存。
 # 这些数据都可以重建，Redis 不可用时各功能会降级（登录限流回退数据库、
 # 吊销与缓存跳过），但 /ready 会把实例标记为未就绪，生产环境应保证其可用。
 # 本地启动：docker run --rm -p 6379:6379 redis:latest
 [redis]
+# 连接地址，必须以 redis:// 或 rediss:// 开头（启动时校验）；
+# 带认证或指定库时写成 redis://:password@host:6379/0。
 url = "redis://127.0.0.1:6379"
 pool_size = 8 # 连接池上限：Redis 一条多路复用连接即可承载并发，这里限制的是突发连接数。
 key_prefix = "axum" # 键命名空间：多环境共用一个实例时必须区分，避免相互覆盖。
 user_cache_ttl_seconds = 60 # 用户详情缓存 TTL（秒）。写入路径会主动删缓存，这里只是最后一道兜底。
 
-[log]
-level = "info"
-
 # JWT 配置。
 # secret 仅是本地开发用的占位值，生产环境必须通过 APP__JWT__SECRET 注入高强度随机密钥；
 # 启动时会校验长度，不足 32 个字符的密钥将导致启动失败。
 [jwt]
+# HS256 签名密钥，安全性完全依赖其熵。可用 `openssl rand -base64 48` 生成，
+# 泄露后任何人都能离线伪造任意用户的令牌。
 secret = "dev-only-insecure-secret-change-me-32chars"
+# 令牌签发者（JWT 的 iss 声明），用于校验令牌确实由本服务签发；
+# 同一密钥被多个服务共用时，该字段是区分来源的依据。
 issuer = "rust-axum-server"
+# access token 有效期（分钟）。取值必须为正数；因为无状态令牌无法单独吊销，
+# 该值越短泄露窗口越小，代价是客户端刷新更频繁。
 access_ttl_minutes = 15
+# refresh token 有效期（天）。到期后必须重新登录，它决定了「一次登录能用多久」。
 refresh_ttl_days = 7
 
 # 登录保护配置：滑动窗口内失败次数达到上限后暂时拒绝登录尝试。
 [auth]
-max_login_failures = 5
-login_window_minutes = 15
+max_login_failures = 5 # 窗口内允许的最大登录失败次数，达到上限即暂时锁定该账号的登录；必须为正数。
+login_window_minutes = 15 # 失败次数统计窗口（分钟），窗口滑动过期后失败计数自动回落；必须为正数。
 # 令牌 Cookie 配置。
 # secure = false 仅适用于本地 HTTP 调试；生产环境必须改为 true，
 # 否则令牌会在明文 HTTP 中传输并可能被中间人截获。
 # same_site 默认 strict，禁止浏览器在跨站请求中携带令牌 Cookie。
 [auth.cookie]
-access_name = "access_token"
-refresh_name = "refresh_token"
-secure = false
-same_site = "strict"
-path = "/"
+access_name = "access_token" # access token 的 Cookie 名。不得为空，且必须与 refresh_name 不同（启动时校验）。
+refresh_name = "refresh_token" # refresh token 的 Cookie 名。两者分开是为了让刷新接口只读取长期令牌，缩短短令牌的暴露面。
+secure = false # 是否仅通过 HTTPS 发送：true 时浏览器在明文 HTTP 下不会携带 Cookie。生产环境必须为 true。
+same_site = "strict" # SameSite 属性，可写 strict 或 lax；取任何非 lax 的值都按 Strict 处理，避免写错时防护被静默放宽。
+path = "/" # Cookie 作用路径。"/" 表示全站携带；收窄到 /api 等前缀可减少静态资源请求带上令牌的机会。
 
 # 引导账号配置：数据库还没有任何用户时创建首个可登录账号。
 # 存在的原因：/api/v1 下所有接口都要求登录，而创建用户的接口自身也在该路由组内，
@@ -51,8 +89,9 @@ path = "/"
 # 凭据属于敏感信息：本文件会提交到仓库，只保留空值，
 # 真实口令请写入 config/local.toml（已被 .gitignore 排除）或通过 APP__BOOTSTRAP__* 注入。
 [bootstrap]
-enabled = false
-username = ""
-email = ""
-password = ""
-
+enabled = false # 是否启用引导建号。默认关闭；开启后 username/email/password 三项均不能为空，否则启动失败。
+username = "" # 引导账号用户名，需满足用户创建接口的同类校验规则。
+email = "" # 引导账号邮箱，同样复用用户创建接口的校验规则。
+password = "" # 明文口令，仅在启动期用于计算 Argon2 哈希，不会被持久化；切勿提交真实口令。
+# nickname 为可选字段（省略即按 None 处理），需要设置时取消注释：
+# nickname = ""

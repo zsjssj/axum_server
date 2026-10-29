@@ -90,8 +90,7 @@ impl AuthService {
         // 先判定限流，再执行密码校验。顺序不能颠倒：Argon2 校验被刻意设计得很慢，
         // 若先校验密码，大量失败请求会持续占用阻塞线程池，使限流本身变成
         // 消耗服务端算力的攻击面。
-        let recent_failures =
-            Self::count_login_failures(db, redis, username, window, window_start).await?;
+        let recent_failures = Self::count_login_failures(db, redis, username, window, window_start).await?;
         if recent_failures >= auth_config.max_login_failures {
             tracing::warn!(%username, recent_failures, "登录失败次数超过阈值，暂时拒绝登录");
             return Err(AppError::TooManyRequests("登录失败次数过多，请稍后再试"));
@@ -125,15 +124,7 @@ impl AuthService {
         // 被脚本修剪，键本身也带 TTL，不需要额外维护。
         AuthRepository::clear_failures_before(db, username, window_start).await?;
 
-        Self::issue_token_pair(
-            db,
-            jwt_config,
-            credentials.id,
-            credentials.public_id,
-            context.client_ip,
-            context.user_agent,
-        )
-        .await
+        Self::issue_token_pair(db, jwt_config, credentials.id, credentials.public_id, context.client_ip, context.user_agent).await
     }
 
     /// 统计窗口内的登录失败次数。
@@ -141,13 +132,7 @@ impl AuthService {
     /// Redis 是判定用的加速层，数据库是权威审计来源：Redis 不可用时回退为
     /// 直接统计 `login_failures` 表。这条回退路径保证 Redis 故障不会让登录
     /// 保护整体失效，代价只是这一次判定慢一点。
-    async fn count_login_failures(
-        db: &PgPool,
-        redis: &RedisStore,
-        username: &str,
-        window: Duration,
-        window_start: DateTime<Utc>,
-    ) -> Result<i64, AppError> {
+    async fn count_login_failures(db: &PgPool, redis: &RedisStore, username: &str, window: Duration, window_start: DateTime<Utc>) -> Result<i64, AppError> {
         match redis.login_failure_count(username, window).await {
             Ok(count) => Ok(count),
             Err(error) => {
@@ -161,13 +146,7 @@ impl AuthService {
     ///
     /// 先写数据库审计，再写 Redis 计数。Redis 写入失败只告警：审计记录已经落库，
     /// 后续判定会自动回退到数据库统计，因此本次请求不需要以失败告终。
-    async fn record_login_failure(
-        db: &PgPool,
-        redis: &RedisStore,
-        username: &str,
-        client_ip: Option<&str>,
-        window: Duration,
-    ) -> Result<(), AppError> {
+    async fn record_login_failure(db: &PgPool, redis: &RedisStore, username: &str, client_ip: Option<&str>, window: Duration) -> Result<(), AppError> {
         AuthRepository::record_failure(db, username, client_ip).await?;
 
         if let Err(error) = redis.record_login_failure(username, window).await {
@@ -200,10 +179,7 @@ impl AuthService {
         // 合法客户端在轮换后不会再用旧令牌。此时无法分辨谁是攻击者，
         // 只能吊销该用户全部会话，让双方都重新登录。
         if session.is_revoked {
-            tracing::warn!(
-                user_id = session.user_id,
-                "检测到已吊销的刷新令牌被再次使用，强制该用户全部会话下线"
-            );
+            tracing::warn!(user_id = session.user_id, "检测到已吊销的刷新令牌被再次使用，强制该用户全部会话下线");
             AuthRepository::revoke_all_sessions_for_user(db, session.user_id).await?;
             return Err(AppError::Unauthorized("刷新令牌已失效，请重新登录"));
         }
@@ -212,22 +188,13 @@ impl AuthService {
             return Err(AppError::Unauthorized("刷新令牌已过期，请重新登录"));
         }
 
-        let token_pair = Self::issue_token_pair(
-            db,
-            jwt_config,
-            session.user_id,
-            session.public_id,
-            client_ip,
-            user_agent,
-        )
-        .await?;
+        let token_pair = Self::issue_token_pair(db, jwt_config, session.user_id, session.public_id, client_ip, user_agent).await?;
 
         // 新会话已经落库，再把旧会话标记为已吊销并记录轮换关系。
-        let new_session_id =
-            AuthRepository::find_session_with_user(db, &hash_token(&token_pair.refresh_token))
-                .await?
-                .ok_or(AppError::Internal("令牌会话写入后无法读取"))?
-                .id;
+        let new_session_id = AuthRepository::find_session_with_user(db, &hash_token(&token_pair.refresh_token))
+            .await?
+            .ok_or(AppError::Internal("令牌会话写入后无法读取"))?
+            .id;
         AuthRepository::rotate_session(db, session.id, new_session_id).await?;
 
         Ok(token_pair)
@@ -240,8 +207,7 @@ impl AuthService {
     pub async fn logout(db: &PgPool, refresh_token: &str) -> Result<(), AppError> {
         let token_hash = hash_token(refresh_token);
 
-        let Some(session) = AuthRepository::find_session_by_token_hash(db, &token_hash).await?
-        else {
+        let Some(session) = AuthRepository::find_session_by_token_hash(db, &token_hash).await? else {
             // 令牌无法对应任何会话，说明它从未被签发或已被清理。
             // 从调用方视角登出目标已达成，因此同样返回成功而不是报错。
             return Ok(());
@@ -261,11 +227,7 @@ impl AuthService {
     ///
     /// 无法解析或已过期的令牌直接返回成功：这类令牌本来就通不过认证中间件，
     /// 写入一条永远不会被查询的记录没有意义。
-    pub async fn revoke_access_token(
-        redis: &RedisStore,
-        jwt_config: &JwtConfig,
-        token: &str,
-    ) -> Result<(), AppError> {
+    pub async fn revoke_access_token(redis: &RedisStore, jwt_config: &JwtConfig, token: &str) -> Result<(), AppError> {
         let Ok(claims) = decode_access_claims(jwt_config, token) else {
             return Ok(());
         };
@@ -285,21 +247,12 @@ impl AuthService {
     }
 
     /// 解析 access token，返回用户身份、吊销标识与到期时间。
-    pub fn verify_access_token(
-        jwt_config: &JwtConfig,
-        token: &str,
-    ) -> Result<VerifiedAccessToken, AppError> {
+    pub fn verify_access_token(jwt_config: &JwtConfig, token: &str) -> Result<VerifiedAccessToken, AppError> {
         let claims = decode_access_claims(jwt_config, token)?;
 
-        let user_id = claims
-            .sub
-            .parse::<i64>()
-            .map_err(|_| AppError::Unauthorized("认证令牌无效"))?;
+        let user_id = claims.sub.parse::<i64>().map_err(|_| AppError::Unauthorized("认证令牌无效"))?;
 
-        Ok(VerifiedAccessToken {
-            user_id,
-            jti: claims.jti,
-        })
+        Ok(VerifiedAccessToken { user_id, jti: claims.jti })
     }
 
     /// 签发一个 access token，仅供测试构造已登录请求使用。
@@ -328,12 +281,7 @@ impl AuthService {
             typ: TOKEN_TYPE_ACCESS.to_owned(),
         };
 
-        encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &EncodingKey::from_secret(jwt_config.secret.as_bytes()),
-        )
-        .expect("测试用 access token 应签发成功")
+        encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(jwt_config.secret.as_bytes())).expect("测试用 access token 应签发成功")
     }
 
     /// 加载当前登录用户的公开资料。
@@ -372,21 +320,9 @@ impl AuthService {
 
         // 只把摘要写入数据库：即使数据库泄露，攻击者也无法用摘要反推出
         // 可用于认证的原始刷新令牌。
-        AuthRepository::create_session(
-            db,
-            user_id,
-            &refresh_token_hash,
-            refresh_expires_at,
-            client_ip,
-            user_agent,
-        )
-        .await?;
+        AuthRepository::create_session(db, user_id, &refresh_token_hash, refresh_expires_at, client_ip, user_agent).await?;
 
-        Ok(TokenPair::new(
-            access_token,
-            refresh_token,
-            access_expires_in.num_seconds(),
-        ))
+        Ok(TokenPair::new(access_token, refresh_token, access_expires_in.num_seconds()))
     }
 }
 
@@ -407,12 +343,7 @@ fn rate_limit_window(auth_config: &AuthConfig) -> Duration {
 }
 
 /// 签发 access token。
-fn encode_access_token(
-    jwt_config: &JwtConfig,
-    user_id: i64,
-    public_id: Uuid,
-    now: DateTime<Utc>,
-) -> Result<String, AppError> {
+fn encode_access_token(jwt_config: &JwtConfig, user_id: i64, public_id: Uuid, now: DateTime<Utc>) -> Result<String, AppError> {
     // jti 使用 public_id 与签发时间组合，保证同一用户在同一秒内多次登录
     // 也能得到不同取值，便于日志区分单次签发。
     let claims = AccessClaims {
@@ -424,12 +355,7 @@ fn encode_access_token(
         typ: TOKEN_TYPE_ACCESS.to_owned(),
     };
 
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(jwt_config.secret.as_bytes()),
-    )
-    .map_err(|error| {
+    encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(jwt_config.secret.as_bytes())).map_err(|error| {
         tracing::error!(%error, "access token 签发失败");
         AppError::Internal("令牌签发失败")
     })
@@ -446,20 +372,14 @@ fn decode_access_claims(jwt_config: &JwtConfig, token: &str) -> Result<AccessCla
     // 允许少量时钟偏移，避免多实例部署时因时钟不同步导致令牌被误判为过期。
     validation.leeway = 5;
 
-    let token_data = decode::<AccessClaims>(
-        token,
-        &DecodingKey::from_secret(jwt_config.secret.as_bytes()),
-        &validation,
-    )
-    .map_err(|error| match error.kind() {
-        jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-            AppError::Unauthorized("认证令牌已过期")
-        }
-        other => {
-            tracing::debug!(?other, "access token 校验失败");
-            AppError::Unauthorized("认证令牌无效")
-        }
-    })?;
+    let token_data =
+        decode::<AccessClaims>(token, &DecodingKey::from_secret(jwt_config.secret.as_bytes()), &validation).map_err(|error| match error.kind() {
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => AppError::Unauthorized("认证令牌已过期"),
+            other => {
+                tracing::debug!(?other, "access token 校验失败");
+                AppError::Unauthorized("认证令牌无效")
+            }
+        })?;
 
     // 断言类型，阻止长效刷新令牌被当作 access token 使用。
     if token_data.claims.typ != TOKEN_TYPE_ACCESS {
@@ -512,12 +432,9 @@ async fn verify_password(password: &str, encoded_hash: &str) -> Result<bool, App
 
 /// 同步校验密码，返回是否匹配。
 fn verify_password_blocking(password: &str, encoded_hash: &str) -> Result<bool, AppError> {
-    let parsed_hash =
-        PasswordHash::new(encoded_hash).map_err(|_| AppError::Internal("密码哈希格式非法"))?;
+    let parsed_hash = PasswordHash::new(encoded_hash).map_err(|_| AppError::Internal("密码哈希格式非法"))?;
 
-    Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
-        .is_ok())
+    Ok(Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok())
 }
 
 /// 对不存在的用户执行等价的密码校验，用于抹平响应时间差异。
@@ -561,11 +478,9 @@ mod tests {
     fn encodes_and_decodes_access_token() {
         let config = test_jwt_config();
         let now = Utc::now();
-        let token =
-            encode_access_token(&config, 42, Uuid::now_v7(), now).expect("access token 应签发成功");
+        let token = encode_access_token(&config, 42, Uuid::now_v7(), now).expect("access token 应签发成功");
 
-        let verified =
-            AuthService::verify_access_token(&config, &token).expect("刚签发的令牌应通过校验");
+        let verified = AuthService::verify_access_token(&config, &token).expect("刚签发的令牌应通过校验");
 
         assert_eq!(verified.user_id, 42);
         assert!(!verified.jti.is_empty(), "jti 用作吊销键，不能为空");
@@ -574,8 +489,7 @@ mod tests {
     #[test]
     fn rejects_token_signed_with_another_secret() {
         let config = test_jwt_config();
-        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now())
-            .expect("access token 应签发成功");
+        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("access token 应签发成功");
 
         let mut other_config = test_jwt_config();
         other_config.secret = "another-unit-test-secret-32-characters".to_owned();
@@ -589,16 +503,12 @@ mod tests {
     #[test]
     fn rejects_token_with_another_issuer() {
         let config = test_jwt_config();
-        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now())
-            .expect("access token 应签发成功");
+        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("access token 应签发成功");
 
         let mut other_config = test_jwt_config();
         other_config.issuer = "another-issuer".to_owned();
 
-        assert!(
-            AuthService::verify_access_token(&other_config, &token).is_err(),
-            "签发者不匹配的令牌必须被拒绝"
-        );
+        assert!(AuthService::verify_access_token(&other_config, &token).is_err(), "签发者不匹配的令牌必须被拒绝");
     }
 
     #[test]
@@ -606,8 +516,7 @@ mod tests {
         let mut config = test_jwt_config();
         config.access_ttl_minutes = -10;
 
-        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now())
-            .expect("access token 应签发成功");
+        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("access token 应签发成功");
 
         // 恢复正数有效期，确保失败原因只可能是令牌过期。
         config.access_ttl_minutes = 15;
@@ -632,12 +541,7 @@ mod tests {
             jti: "test".to_owned(),
             typ: "refresh".to_owned(),
         };
-        let token = encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &EncodingKey::from_secret(config.secret.as_bytes()),
-        )
-        .expect("测试令牌应签发成功");
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(config.secret.as_bytes())).expect("测试令牌应签发成功");
 
         match AuthService::verify_access_token(&config, &token) {
             Err(AppError::Unauthorized(message)) => assert_eq!(message, "认证令牌类型错误"),
@@ -657,17 +561,9 @@ mod tests {
             jti: "test".to_owned(),
             typ: TOKEN_TYPE_ACCESS.to_owned(),
         };
-        let token = encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &EncodingKey::from_secret(config.secret.as_bytes()),
-        )
-        .expect("测试令牌应签发成功");
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(config.secret.as_bytes())).expect("测试令牌应签发成功");
 
-        assert!(
-            AuthService::verify_access_token(&config, &token).is_err(),
-            "主体不是数字的令牌必须被拒绝"
-        );
+        assert!(AuthService::verify_access_token(&config, &token).is_err(), "主体不是数字的令牌必须被拒绝");
     }
 
     /// 窗口至少一分钟：零长度窗口等于关闭限流。
@@ -689,11 +585,7 @@ mod tests {
 
         let mut zero_window = config.clone();
         zero_window.login_window_minutes = 0;
-        assert_eq!(
-            rate_limit_window(&zero_window),
-            Duration::from_secs(60),
-            "非法窗口应兜底为一分钟，而不是变成零"
-        );
+        assert_eq!(rate_limit_window(&zero_window), Duration::from_secs(60), "非法窗口应兜底为一分钟，而不是变成零");
     }
 
     /// 无法解析的令牌不应触发任何 Redis 写入：它本来就通不过认证中间件。
@@ -703,10 +595,7 @@ mod tests {
 
         let result = AuthService::revoke_access_token(&store, &test_jwt_config(), "not-a-jwt").await;
 
-        assert!(
-            result.is_ok(),
-            "无法解析的令牌应直接返回成功，且不访问 Redis"
-        );
+        assert!(result.is_ok(), "无法解析的令牌应直接返回成功，且不访问 Redis");
     }
 
     /// 已过期的令牌无需写入吊销列表：它已经不可能通过认证。
@@ -715,8 +604,7 @@ mod tests {
         let store = crate::infrastructure::redis::RedisStore::without_connection();
         let mut config = test_jwt_config();
         config.access_ttl_minutes = -10;
-        let expired = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now())
-            .expect("access token 应签发成功");
+        let expired = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("access token 应签发成功");
         config.access_ttl_minutes = 15;
 
         let result = AuthService::revoke_access_token(&store, &config, &expired).await;
@@ -752,14 +640,8 @@ mod tests {
     fn verifies_matching_password() {
         let hash = hash_password("correct-password").expect("密码应哈希成功");
 
-        assert!(
-            verify_password_blocking("correct-password", &hash).expect("校验应成功"),
-            "正确密码应通过校验"
-        );
-        assert!(
-            !verify_password_blocking("wrong-password", &hash).expect("校验应成功"),
-            "错误密码不应通过校验"
-        );
+        assert!(verify_password_blocking("correct-password", &hash).expect("校验应成功"), "正确密码应通过校验");
+        assert!(!verify_password_blocking("wrong-password", &hash).expect("校验应成功"), "错误密码不应通过校验");
     }
 
     #[test]
@@ -776,10 +658,7 @@ mod tests {
     /// 使响应时间重新变得可区分，时间攻击防护随之失效。
     #[test]
     fn dummy_password_hash_is_parseable() {
-        assert!(
-            PasswordHash::new(DUMMY_PASSWORD_HASH).is_ok(),
-            "占位哈希必须是合法的 Argon2 编码"
-        );
+        assert!(PasswordHash::new(DUMMY_PASSWORD_HASH).is_ok(), "占位哈希必须是合法的 Argon2 编码");
     }
 
     #[test]

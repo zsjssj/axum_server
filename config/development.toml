@@ -8,9 +8,9 @@ max_connections = 10
 
 [redis]
 url = "redis://127.0.0.1:6379"
-pool_size = 8 # 连接池上限：Redis 一条多路复用连接即可承载并发，这里限制的是突发连接数。
-key_prefix = "axum" # 键命名空间：多环境共用一个实例时必须区分，避免相互覆盖。
-user_cache_ttl_seconds = 60 # 用户详情缓存 TTL（秒）。写入路径会主动删缓存，这里只是最后一道兜底。
+pool_size = 8 
+key_prefix = "axum" 
+user_cache_ttl_seconds = 60 
 
 [log]
 level = "info"
@@ -20,7 +20,6 @@ secret = "dev-only-insecure-secret-change-me-32chars"
 issuer = "rust-axum-server"
 access_ttl_minutes = 15
 refresh_ttl_days = 7
-
 
 [auth]
 max_login_failures = 5
