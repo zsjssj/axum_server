@@ -64,6 +64,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), MigrateError> {
 | --- | --- |
 | `001_create_users_table.sql` | `users` 表 + email/username 索引 |
 | `002_create_auth_tables.sql` | `user_sessions`、`login_failures` 两张表 + 索引 |
+| `003_create_information_tables.sql` | 聊天会话、成员、消息相关表 |
+| `004_sync_users_disabled_columns.sql` | 为早期已存在的 `users` 表补 `is_disabled` / `disabled_at`（幂等 ALTER） |
 
 `002` 文件的注释解释了这个约定：
 

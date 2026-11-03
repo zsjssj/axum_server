@@ -13,7 +13,7 @@ key_prefix = "axum"
 user_cache_ttl_seconds = 60 
 
 [log]
-level = "info"
+level = "debug"
 
 [jwt]
 secret = "dev-only-insecure-secret-change-me-32chars"

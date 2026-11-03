@@ -18,7 +18,7 @@
 - config + dotenv：分环境配置加载。
 - tracing：结构化日志。
 - Argon2：密码哈希。
-- jsonwebtoken：签发与校验 access token（HS256）。
+- jsonwebtoken：签发与校验 access token（HS256）。11 起加密后端为可选特性，必须显式启用 `rust_crypto`（或 `aws_lc_rs`），否则首次签发会 panic。
 - Utoipa + Swagger UI：从代码注解生成 OpenAPI 文档并提供交互式浏览入口。
 
 ## 2. 目录与职责
@@ -316,7 +316,7 @@ Cookie 会自动随请求发送，因此必须防 CSRF。主要防线是 `SameSi
 - 健康检查 `/health` 只表示进程可响应；就绪检查 `/ready` 会探测数据库与 Redis，两者任一不可用即返回 `503`，避免「降级运行」的实例继续接收流量。
 - Redis 键统一带 `redis.key_prefix` 命名空间（如 `axum:auth:login_failures:<username>`），多环境共用一个实例时互不干扰；配置校验拒绝空前缀。
 - 数据库结构通过 `migrations` 目录中的脚本维护；迁移脚本会在编译时嵌入程序，并在服务启动、开始监听端口前自动执行。
-- 已发布或可能已执行的结构变更应新增迁移文件，不直接修改历史迁移；任何迁移失败都会中止服务启动。认证相关表通过 `002_create_auth_tables.sql` 新增，聊天相关表通过 `003_create_information_tables.sql` 新增，均未改动更早的迁移。
+- 已发布或可能已执行的结构变更应新增迁移文件，不直接修改历史迁移；任何迁移失败都会中止服务启动。认证相关表通过 `002_create_auth_tables.sql` 新增，聊天相关表通过 `003_create_information_tables.sql` 新增，`004_sync_users_disabled_columns.sql` 以幂等 ALTER 为早期已存在的 `users` 表补齐 `is_disabled` / `disabled_at`，均未改动更早的迁移。
 - 聊天数据的归属判断写在 SQL 里：查询消息与会话时都用 `JOIN conversation_members ... AND user_id = $n` 过滤，非成员得到的是「查不到」而不是「查到了但不属于你」。归属因此是数据访问层的结果，而不是业务层的一个 `if`——后者每新增一个查询方法就多一次漏写的可能，且数据已经进入应用内存，日志与调试输出都可能把它带出去。
 - 会话内消息序号（`messages.seq`）独立于自增主键：自增主键是全局的，对外暴露会泄露「全站一共发了多少条消息」，而会话内序号只暴露该会话自身的规模，且正是聊天客户端需要的分页游标。
 

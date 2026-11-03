@@ -35,8 +35,7 @@ async fn main() {
 /// 提供的泄露防护也会失效。
 async fn run() -> anyhow::Result<()> {
     let config = AppConfig::new().context("加载应用配置失败")?;
-    // 先校验配置再初始化其他组件：弱 JWT 密钥等问题必须在监听端口之前暴露，
-    // 否则服务会带着可被伪造的令牌签发能力对外提供服务。
+    // 先校验配置再初始化其他组件：弱 JWT 密钥等问题必须在监听端口之前暴露，否则服务会带着可被伪造的令牌签发能力对外提供服务。
     config.validate().context("应用配置校验失败")?;
     init_tracing(&config.log.level); // 初始化日志系统
 
@@ -44,8 +43,7 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("创建数据库连接池失败")?; // 创建数据库连接池
     database::run_migrations(&db_pool).await.context("数据库迁移失败")?; // 在接收请求前完成数据库结构迁移
-    // 迁移之后、监听端口之前创建引导账号：数据库为空时没有任何账号能通过登录，
-    // 而创建用户的接口自身也要求登录，这一步是唯一能让空库变得可用的出口。
+    // 迁移之后、监听端口之前创建引导账号：数据库为空时没有任何账号能通过登录，而创建用户的接口自身也要求登录，这一步是唯一能让空库变得可用的出口。
     bootstrap::ensure_bootstrap_user(&db_pool, &config.bootstrap)
         .await
         .context("引导账号初始化失败")?;

@@ -9,15 +9,18 @@ edition = "2024"
 # Repository 必须继续返回带类型的 AppError，由它决定对外状态码与业务码，详见 docs/07 第 7.4 节。
 anyhow = "1"
 argon2 = "0.6.0"
-axum = "0.7"
+axum = "0.8.9"
 bb8 = "0.9.1"
 chrono = { version = "0.4", features = ["serde"] }
-config = "0.14"
+config = "0.15"
 # 仅用于解析请求中的 Cookie 头；Set-Cookie 由项目自行拼装以精确控制安全属性。
 cookie = "0.18"
 dotenvy = "0.15.7"
-jsonwebtoken = "9"
-rand = "0.8"
+# jsonwebtoken 11 起把加密后端改为可选特性，仅 `use_pem` 是默认值：
+# 不显式启用 rust_crypto（纯 Rust 实现）或 aws_lc_rs（需要本地 C 工具链）时，
+# 首次签发/校验令牌会 panic "Could not automatically determine the process-level CryptoProvider"。
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+rand = "0.10"
 # script 特性用于 EVAL：登录失败计数需要「修剪 + 写入 + 统计」原子完成。
 # tokio-rustls-comp 让 `rediss://` 真正可用（TLS 连接），配置校验也接受该协议。
 redis = { version = "1.7.1", default-features = false, features = [
@@ -28,24 +31,25 @@ redis = { version = "1.7.1", default-features = false, features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
-sqlx = { version = "0.8", features = [
-    "runtime-tokio-rustls",
+sha2 = "0.11"
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "tls-rustls",
     "postgres",
     "chrono",
     "uuid",
 ] }
 thiserror = "2.0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
-tower-http = { version = "0.5", features = ["cors","trace"] }
+tower-http = { version = "0.7", features = ["cors","trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # chrono 特性让 `chrono::DateTime<Tz>` 直接生成字符串类型的 OpenAPI Schema，
 # 聊天模块的时间字段因此不必逐个手写 `#[schema(value_type = String)]`。
-utoipa = { version = "5.5.0", features = ["uuid", "chrono"] }
-utoipa-swagger-ui = { version = "8", features = ["axum", "vendored"] }
+utoipa = { version = "6.0.0", features = ["uuid", "chrono"] }
+utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["serde", "v7"] }
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

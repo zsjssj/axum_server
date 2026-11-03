@@ -1,16 +1,14 @@
 use crate::common::error::AppError;
 use axum::{
-    async_trait,
-    extract::{FromRequest, FromRequestParts, Json, Path, Query, Request, rejection::JsonRejection},
+    extract::{ConnectInfo, FromRequest, FromRequestParts, Json, Path, Query, Request, rejection::JsonRejection},
     http::request::Parts,
 };
 use serde::de::DeserializeOwned;
-use std::{fmt::Debug, str::FromStr};
+use std::{convert::Infallible, fmt::Debug, net::SocketAddr, str::FromStr};
 use validator::Validate;
 
 /// 完成 JSON 反序列化后执行模型校验，并将两类错误都转换为统一响应。
 pub struct ValidatedJson<T>(pub T);
-#[async_trait]
 impl<S, T> FromRequest<S> for ValidatedJson<T>
 where
     S: Send + Sync,
@@ -26,7 +24,6 @@ where
 
 /// 完成查询参数反序列化后执行模型校验。
 pub struct ValidatedQuery<T>(pub T);
-#[async_trait]
 impl<S, T> FromRequestParts<S> for ValidatedQuery<T>
 where
     S: Send + Sync,
@@ -44,7 +41,6 @@ where
 
 /// 包装路径参数提取，避免 Axum 的纯文本拒绝响应绕过统一错误格式。
 pub struct ApiPath<T>(pub T);
-#[async_trait]
 impl<S, T> FromRequestParts<S> for ApiPath<T>
 where
     S: Send + Sync,
@@ -58,6 +54,27 @@ where
             .map_err(|_| AppError::BadRequest("路径参数缺失"))?;
         let value = raw_value.parse::<T>().map_err(|_| AppError::BadRequest("路径参数格式错误"))?;
         Ok(Self(value))
+    }
+}
+
+/// 客户端连接信息，允许缺失。
+///
+/// axum 0.8 起 `Option<T>` 提取器只对实现了 `OptionalFromRequestParts` 的类型生效，
+/// 而 `ConnectInfo<T>` 只实现 `FromRequestParts`；直接写 `Option<ConnectInfo<SocketAddr>>`
+/// 会让整个 Handler 不再满足 `Handler` trait 约束。此类型把「是否取得对端地址」
+/// 显式收进一个提取器：没有通过 `into_make_service_with_connect_info` 挂载连接信息时
+/// 返回 `None`，而不是让请求失败——审计字段缺失不应中断登录流程。
+pub struct ClientAddr(pub Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for ClientAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // `ConnectInfo` 由 axum 的 serve 层写入请求扩展，这里只做读取，不做校验。
+        Ok(Self(parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|info| info.0)))
     }
 }
 
@@ -81,7 +98,7 @@ mod tests {
         async fn handler(ApiPath(value): ApiPath<Uuid>) -> String {
             value.to_string()
         }
-        let app = Router::new().route("/users/:public_id", get(handler));
+        let app = Router::new().route("/users/{public_id}", get(handler));
         let id = Uuid::now_v7();
         let response = tower::ServiceExt::oneshot(
             app,

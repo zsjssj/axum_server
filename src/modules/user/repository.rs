@@ -12,7 +12,7 @@ impl UserRepository {
             r#"
             INSERT INTO users (public_id, username, email, password_hash, nickname)
             VALUES ($1, $2, $3, $4, $5)
-            RETURNING public_id, username, email, nickname, created_at, updated_at
+            RETURNING public_id, username, email, nickname, is_disabled, created_at, updated_at
             "#,
         )
         .bind(public_id)
@@ -30,7 +30,7 @@ impl UserRepository {
     pub async fn find_by_public_id(db: &PgPool, public_id: Uuid) -> Result<Option<User>, sqlx::Error> {
         let user = sqlx::query_as::<_, User>(
             r#"
-            SELECT public_id, username, email, nickname, created_at, updated_at
+            SELECT public_id, username, email, nickname, is_disabled, created_at, updated_at
             FROM users
             WHERE public_id = $1
             "#,
@@ -49,7 +49,7 @@ impl UserRepository {
     pub async fn find_by_id(db: &PgPool, id: i64) -> Result<Option<User>, sqlx::Error> {
         let user = sqlx::query_as::<_, User>(
             r#"
-            SELECT public_id, username, email, nickname, created_at, updated_at
+            SELECT public_id, username, email, nickname, is_disabled, created_at, updated_at
             FROM users
             WHERE id = $1
             "#,
@@ -83,10 +83,9 @@ impl UserRepository {
     /// 查询所有用户（分页）
     pub async fn find_all(db: &PgPool, page: i64, page_size: i64) -> Result<Vec<User>, sqlx::Error> {
         let offset = (page - 1) * page_size;
-
         let users = sqlx::query_as::<_, User>(
             r#"
-            SELECT public_id, username, email, nickname, created_at, updated_at
+            SELECT public_id, username, email, nickname,is_disabled, created_at, updated_at
             FROM users
             ORDER BY id DESC
             LIMIT $1 OFFSET $2
@@ -96,7 +95,6 @@ impl UserRepository {
         .bind(offset)
         .fetch_all(db)
         .await?;
-
         Ok(users)
     }
 
@@ -115,7 +113,7 @@ impl UserRepository {
                 nickname = COALESCE($3, nickname),
                 updated_at = NOW()
             WHERE public_id = $1
-            RETURNING public_id, username, email, nickname, created_at, updated_at
+            RETURNING public_id, username, email, nickname, is_disabled, created_at, updated_at
             "#,
         )
         .bind(public_id)

@@ -365,10 +365,13 @@ fn decode_access_claims(jwt_config: &JwtConfig, token: &str) -> Result<AccessCla
 }
 
 /// 生成高熵刷新令牌。
+///
+/// rand 0.10 起 `thread_rng()` 更名为 `rng()`，`fill_bytes` 由 `Rng` trait 提供
+/// （`RngCore` 不再从 crate 根重导出）。
 fn generate_refresh_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; REFRESH_TOKEN_BYTES];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     to_hex(&bytes)
 }
 

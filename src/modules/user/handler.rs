@@ -28,10 +28,7 @@ use uuid::Uuid;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/users", get(list_users).post(create_user))
-        .route(
-            "/users/:public_id",
-            get(get_user).put(update_user).delete(delete_user),
-        )
+        .route("/users/{public_id}", get(get_user).put(update_user).delete(delete_user))
 }
 
 /// 创建用户

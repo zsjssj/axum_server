@@ -1,4 +1,4 @@
-use axum::{async_trait, extract::FromRequestParts, http::request::Parts};
+use axum::{extract::FromRequestParts, http::request::Parts};
 
 use crate::app::state::AppState;
 use crate::common::auth::AuthUser;
@@ -18,7 +18,6 @@ pub struct CurrentUser {
     pub user_id: i64,
 }
 
-#[async_trait]
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = AppError;
 

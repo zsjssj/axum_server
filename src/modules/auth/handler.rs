@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    extract::{ConnectInfo, State},
+    extract::State,
     http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -13,7 +13,7 @@ use crate::common::{
     auth_extractor::CurrentUser,
     cookie::{self, build_clear_cookie, build_token_cookie},
     error::{AppError, ErrorData},
-    extractor::ValidatedJson,
+    extractor::{ClientAddr, ValidatedJson},
     response::{ApiResponse, EmptyData},
 };
 use crate::config::CookieConfig;
@@ -41,7 +41,10 @@ pub fn routes() -> Router<AppState> {
 /// 当前只使用 TCP 直连地址，不读取 `X-Forwarded-For`：该头可被客户端任意伪造，
 /// 在未确认反向代理受信之前使用它会让 IP 维度的审计与限流形同虚设。
 /// 部署在受控代理之后时，应改为读取代理注入的头并同步调整限流维度。
-fn client_info(headers: &HeaderMap, connect_info: Option<ConnectInfo<SocketAddr>>) -> ClientInfo {
+///
+/// 连接地址由 [`ClientAddr`] 提供：axum 0.8 的 `Option<T>` 不再接受 `ConnectInfo`，
+/// 该提取器把「可能取不到对端地址」的语义显式化，取不到时审计字段为 `None`。
+fn client_info(headers: &HeaderMap, connect_info: Option<SocketAddr>) -> ClientInfo {
     // 截断 UA 长度：该字段完全由客户端控制，不设上限会成为存储放大手段。
     const MAX_USER_AGENT_LENGTH: usize = 512;
     let user_agent = headers
@@ -49,7 +52,7 @@ fn client_info(headers: &HeaderMap, connect_info: Option<ConnectInfo<SocketAddr>
         .and_then(|value| value.to_str().ok())
         .map(|value| value.chars().take(MAX_USER_AGENT_LENGTH).collect::<String>());
     ClientInfo {
-        ip: connect_info.map(|ConnectInfo(address)| address.ip().to_string()),
+        ip: connect_info.map(|address| address.ip().to_string()),
         user_agent,
     }
 }
@@ -129,11 +132,11 @@ fn refresh_ttl_seconds(state: &AppState) -> i64 {
 )]
 pub(crate) async fn login(
     State(state): State<AppState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    client_addr: ClientAddr,
     headers: HeaderMap,
     ValidatedJson(req): ValidatedJson<LoginRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let client = client_info(&headers, connect_info);
+    let client = client_info(&headers, client_addr.0);
     let tokens = AuthService::login(
         &state.db,
         &state.redis,
@@ -161,12 +164,8 @@ pub(crate) async fn login(
         (status = 500, description = "服务器内部错误", body = ApiResponse<ErrorData>)
     )
 )]
-pub(crate) async fn refresh_token(
-    State(state): State<AppState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    let client = client_info(&headers, connect_info);
+pub(crate) async fn refresh_token(State(state): State<AppState>, client_addr: ClientAddr, headers: HeaderMap) -> Result<impl IntoResponse, AppError> {
+    let client = client_info(&headers, client_addr.0);
     let refresh_token = cookie::refresh_token_from_headers(&headers, &state.auth.cookie).ok_or(AppError::Unauthorized("缺少刷新令牌"))?;
     let tokens = AuthService::refresh(&state.db, &state.jwt, &refresh_token, client.ip.as_deref(), client.user_agent.as_deref()).await?;
     session_response(&state.auth.cookie, tokens, refresh_ttl_seconds(&state), "刷新成功")

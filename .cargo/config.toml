@@ -1,0 +1,13 @@
+# 编译期临时目录（MSVC 的 cl.exe / link.exe 需要）。
+#
+# 背景：部分受限终端会话（例如通过带沙箱的终端启动的会话）会把 %TEMP% 指向
+# 不可写的位置。ring 的 C 编译要调用 cl.exe，它需要往临时目录写「调试记录」
+# 文件；写不进去时 cl 会以 `D8050: 无法执行 c1.dll` 退出，构建就停在
+# `ring v0.17.14` 上。
+#
+# 这里把 TMP/TEMP 固定到工作区内的 .tmp 目录：受限会话对该目录有写权限，
+# 编译中间文件也不会散落到系统 temp。force = true 是必须的——默认情况下
+# 父进程环境里的 TMP/TEMP 优先，而问题恰恰出在父进程传下来的那个值上。
+[env]
+TMP = { value = ".tmp", relative = true, force = true }
+TEMP = { value = ".tmp", relative = true, force = true }

@@ -31,15 +31,18 @@ use crate::modules::information::{
 use uuid::Uuid;
 
 /// 聊天消息路由。
+///
+/// 路径参数使用 `{name}` 语法：axum 0.8 依赖的 matchit 0.8 已移除 `:name`，
+/// 旧写法会在 `Router::route` 注册路由时直接 panic，而不是解析失败。
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/conversations", get(list_conversations).post(create_conversation))
-        .route("/conversations/:public_id", get(get_conversation))
-        .route("/conversations/:public_id/messages", get(list_messages).post(send_message))
-        .route("/conversations/:public_id/read", post(mark_read))
-        .route("/conversations/:public_id/members", post(add_members))
-        .route("/conversations/:public_id/members/me", delete(leave_conversation))
-        .route("/messages/:public_id/recall", post(recall_message))
+        .route("/conversations/{public_id}", get(get_conversation))
+        .route("/conversations/{public_id}/messages", get(list_messages).post(send_message))
+        .route("/conversations/{public_id}/read", post(mark_read))
+        .route("/conversations/{public_id}/members", post(add_members))
+        .route("/conversations/{public_id}/members/me", delete(leave_conversation))
+        .route("/messages/{public_id}/recall", post(recall_message))
 }
 
 /// 创建会话

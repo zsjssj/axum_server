@@ -1,3 +1,8 @@
 /target/
 .env
 config/local.toml
+
+# 编译期临时目录（见 .cargo/config.toml）：只需要保留占位文件，
+# 里面的临时文件不纳入版本管理。
+/.tmp/*
+!/.tmp/.gitkeep

@@ -16,6 +16,7 @@ pub struct User {
     pub username: String,
     pub email: String,
     pub nickname: Option<String>,
+    pub is_disabled: bool,
     #[serde(serialize_with = "serialize_datetime", deserialize_with = "deserialize_datetime")]
     #[schema(value_type = String)]
     pub created_at: chrono::NaiveDateTime,
@@ -97,8 +98,7 @@ where
 {
     let value = String::deserialize(deserializer)?;
 
-    chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S")
-        .map_err(serde::de::Error::custom)
+    chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S").map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
@@ -122,10 +122,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_update_request() {
-        let request = UpdateUserRequest {
-            email: None,
-            nickname: None,
-        };
+        let request = UpdateUserRequest { email: None, nickname: None };
         let errors = request.validate().expect_err("空更新请求应校验失败");
 
         assert!(errors.field_errors().contains_key("__all__"));
@@ -136,13 +133,13 @@ mod tests {
     /// 而走数据库的路径却完全正常——这类问题只在有缓存时暴露，必须由测试锁定。
     #[test]
     fn user_round_trips_through_cache_json() {
-        let timestamp = chrono::NaiveDateTime::parse_from_str("2024-05-06 07:08:09", "%Y-%m-%d %H:%M:%S")
-            .expect("测试时间应合法");
+        let timestamp = chrono::NaiveDateTime::parse_from_str("2024-05-06 07:08:09", "%Y-%m-%d %H:%M:%S").expect("测试时间应合法");
         let user = User {
             public_id: Uuid::now_v7(),
             username: "cache-user".to_owned(),
             email: "cache@example.com".to_owned(),
             nickname: Some("缓存用户".to_owned()),
+            is_disabled: false,
             created_at: timestamp,
             updated_at: timestamp,
         };
