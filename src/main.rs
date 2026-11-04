@@ -39,9 +39,7 @@ async fn run() -> anyhow::Result<()> {
     config.validate().context("应用配置校验失败")?;
     init_tracing(&config.log.level); // 初始化日志系统
 
-    let db_pool: PgPool = database::create_pool(&config.database.url, config.database.max_connections)
-        .await
-        .context("创建数据库连接池失败")?; // 创建数据库连接池
+    let db_pool: PgPool = database::create_pool(&config.database).await.context("创建数据库连接池失败")?; // 创建数据库连接池
     database::run_migrations(&db_pool).await.context("数据库迁移失败")?; // 在接收请求前完成数据库结构迁移
     // 迁移之后、监听端口之前创建引导账号：数据库为空时没有任何账号能通过登录，而创建用户的接口自身也要求登录，这一步是唯一能让空库变得可用的出口。
     bootstrap::ensure_bootstrap_user(&db_pool, &config.bootstrap)

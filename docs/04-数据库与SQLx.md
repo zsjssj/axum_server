@@ -144,8 +144,8 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 | 设计 | 原因 |
 | --- | --- |
 | `token_hash CHAR(64)` | SHA-256 十六进制正好 64 字符；**存摘要不存原文**，库泄露也无法冒用令牌 |
-| `revoked_at` 软吊销 | 保留记录才能审计和识别"令牌重放" |
-| `replaced_by` 轮换链 | 记录"旧会话被哪个新会话替代"，是重放检测的证据 |
+| `revoked_at` 软吊销 | 保留记录才能审计"这次会话何时结束"；单令牌方案下它不再影响认证判定 |
+| `replaced_by` 轮换链 | 已废弃：原双令牌轮换机制的遗留列，保留只为兼容历史数据（见 `004_document_single_token_sessions.sql`） |
 | `ON DELETE CASCADE` | 用户删了会话就该没，交给数据库保证 |
 | `INET` 而非 `TEXT` | 数据库校验 IP 格式，非法值写不进去 |
 | `TIMESTAMPTZ` 而非 `TIMESTAMP` | 带时区，跨时区部署不会错位（`users` 表用 `TIMESTAMP` 是历史选择） |
@@ -153,8 +153,8 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 索引对应真实查询：
 
 ```sql
-CREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id);      -- 按用户吊销全部会话
-CREATE INDEX idx_user_sessions_expires_at ON user_sessions(expires_at);-- 清理过期会话
+CREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id);      -- 按用户回看登录历史
+CREATE INDEX idx_user_sessions_expires_at ON user_sessions(expires_at);-- 按到期时间扫描/清理
 ```
 
 **索引不是"多加点更保险"。** 每个索引都让写入变慢一份、占用磁盘一份。判断标准永远是：有没有一条真实的高频查询需要它。
@@ -307,22 +307,35 @@ pub async fn delete(db: &PgPool, public_id: Uuid) -> Result<bool, sqlx::Error> {
 
 ## 4.5 事务：一个业务操作的原子边界
 
+以聊天模块的「创建会话 + 写入全部成员」为例：
+
 ```rust
-// src/modules/auth/repository.rs:128
-pub async fn rotate_session(db: &PgPool, old_id: i64, new_id: i64) -> Result<(), sqlx::Error> {
+// src/modules/information/repository.rs:42
+pub async fn create_with_members(db: &PgPool, /* ... */) -> Result<ConversationRow, sqlx::Error> {
     let mut transaction = db.begin().await?;
 
-    sqlx::query(
-        r#"UPDATE user_sessions
-           SET revoked_at = NOW(), replaced_by = $2
-           WHERE id = $1 AND revoked_at IS NULL"#,
+    let conversation = sqlx::query_as::<_, ConversationRow>(
+        r#"INSERT INTO conversations (public_id, kind, title, direct_key)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id, public_id, kind, title, message_seq, created_at"#,
     )
-    .bind(old_id).bind(new_id)
-    .execute(&mut *transaction)
+    .bind(public_id).bind(kind).bind(title).bind(direct_key)
+    .fetch_one(&mut *transaction)
     .await?;
 
+    for member_id in member_ids {
+        sqlx::query(
+            r#"INSERT INTO conversation_members (conversation_id, user_id, role)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (conversation_id, user_id) DO NOTHING"#,
+        )
+        .bind(conversation.id).bind(member_id).bind(role)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
     transaction.commit().await?;
-    Ok(())
+    Ok(conversation)
 }
 ```
 
@@ -330,7 +343,7 @@ pub async fn rotate_session(db: &PgPool, old_id: i64, new_id: i64) -> Result<(),
 
 1. **事务跟随调用链传递**：执行时用 `&mut *transaction`（解引用成 executor），而不是传 `db`。传错了会在事务外执行，事务白开。
 2. **`commit()` 是显式的**。`Transaction` 被 drop 时默认**回滚**——这是一个安全默认值，忘了 commit 不会意外提交半成品。
-3. **事务的边界应该是业务边界**。"吊销旧会话 + 记录轮换关系"必须同时成立，否则会出现"旧令牌已失效但不知道被谁替代"的中间状态。
+3. **事务的边界应该是业务边界**。"会话 + 成员"必须同时成立：只写会话不写成员，会留下一个谁都看不见、却已占用 `direct_key` 唯一键的空会话。
 
 注意事务放在 **Repository** 而不是 Service：Service 决定"要做哪些数据操作"，Repository 负责"这些操作怎么原子地落库"。如果将来需要跨多个 Repository 的事务，才需要把 `Transaction` 提升到 Service——那是另一种做法（`sqlx` 支持把 `&mut PgConnection` 传进 Repository）。
 

@@ -1911,7 +1911,6 @@ dependencies = [
  "dotenvy",
  "http-body-util",
  "jsonwebtoken",
- "rand 0.10.3",
  "redis",
  "serde",
  "serde_json",

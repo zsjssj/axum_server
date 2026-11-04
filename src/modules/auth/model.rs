@@ -19,58 +19,44 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-/// 令牌对，仅用于服务层内部传递。
+/// 一次登录签发的唯一令牌，仅用于服务层内部传递。
 ///
 /// 刻意不派生 `Serialize` 与 `ToSchema`：令牌通过 `Set-Cookie` 响应头下发，
 /// 绝不能进入响应体。类型上不可序列化可以从根本上避免后续被误放进 JSON。
 #[derive(Debug)]
-pub struct TokenPair {
-    pub access_token: String,
-    pub refresh_token: String,
-    /// access token 剩余有效秒数。
+pub struct IssuedToken {
+    /// JWT 令牌本体。
+    pub token: String,
+    /// 令牌剩余有效秒数。
     pub expires_in: i64,
 }
 
-impl TokenPair {
-    pub fn new(access_token: String, refresh_token: String, expires_in: i64) -> Self {
-        Self {
-            access_token,
-            refresh_token,
-            expires_in,
-        }
+impl IssuedToken {
+    pub fn new(token: String, expires_in: i64) -> Self {
+        Self { token, expires_in }
     }
 }
 
-/// 登录与刷新接口的响应体。
+/// 登录接口的响应体。
 ///
-/// 只回传与客户端调度有关的信息，令牌本身只存在于 `Set-Cookie` 响应头中，
+/// 只回传与客户端调度有关的信息：令牌本身只存在于 `Set-Cookie` 响应头中，
 /// 页面脚本无法通过响应体读取令牌。
+///
+/// `expires_in` 是客户端唯一的续期依据：本项目不提供刷新接口，
+/// 客户端只能在到期后引导用户重新登录（或用 `401` 触发的统一拦截兜底）。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AuthSessionResponse {
     /// 认证方式固定为 `cookie`，表示凭据已通过 Cookie 下发。
     pub token_type: String,
-    /// access token 剩余有效秒数，供客户端提前刷新。
+    /// 令牌剩余有效秒数。
     pub expires_in: i64,
-    /// 已下发的 Cookie 名称，便于客户端确认与排查。
-    pub cookies: CookieNames,
-}
-
-/// 已下发的令牌 Cookie 名称。
-#[derive(Debug, Serialize, ToSchema)]
-pub struct CookieNames {
-    pub access_token: String,
-    pub refresh_token: String,
 }
 
 impl AuthSessionResponse {
-    pub fn new(expires_in: i64, access_name: &str, refresh_name: &str) -> Self {
+    pub fn new(expires_in: i64) -> Self {
         Self {
             token_type: "cookie".to_owned(),
             expires_in,
-            cookies: CookieNames {
-                access_token: access_name.to_owned(),
-                refresh_token: refresh_name.to_owned(),
-            },
         }
     }
 }
@@ -122,22 +108,19 @@ mod tests {
     }
 
     #[test]
-    fn token_pair_carries_tokens_and_expiry() {
-        let pair = TokenPair::new("access".to_owned(), "refresh".to_owned(), 900);
+    fn issued_token_carries_token_and_expiry() {
+        let issued = IssuedToken::new("token".to_owned(), 604_800);
 
-        assert_eq!(pair.access_token, "access");
-        assert_eq!(pair.refresh_token, "refresh");
-        assert_eq!(pair.expires_in, 900);
+        assert_eq!(issued.token, "token");
+        assert_eq!(issued.expires_in, 604_800);
     }
 
     /// 响应体只含调度信息，不包含令牌本身。
     #[test]
-    fn auth_session_response_exposes_cookie_names_not_tokens() {
-        let response = AuthSessionResponse::new(900, "access_token", "refresh_token");
+    fn auth_session_response_exposes_expiry_not_token() {
+        let response = AuthSessionResponse::new(604_800);
 
         assert_eq!(response.token_type, "cookie");
-        assert_eq!(response.expires_in, 900);
-        assert_eq!(response.cookies.access_token, "access_token");
-        assert_eq!(response.cookies.refresh_token, "refresh_token");
+        assert_eq!(response.expires_in, 604_800);
     }
 }

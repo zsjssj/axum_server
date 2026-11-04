@@ -26,20 +26,9 @@ impl UserService {
             .await
             .map_err(|_| AppError::Internal("密码哈希任务失败"))??;
 
-        match UserRepository::create(
-            db,
-            public_id,
-            &username,
-            &email,
-            &password_hash,
-            nickname.as_deref(),
-        )
-        .await
-        {
+        match UserRepository::create(db, public_id, &username, &email, &password_hash, nickname.as_deref()).await {
             Ok(user) => Ok(user),
-            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
-                Err(AppError::Conflict("用户名已存在"))
-            }
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => Err(AppError::Conflict("用户名已存在")),
             Err(error) => Err(error.into()),
         }
     }
@@ -48,11 +37,7 @@ impl UserService {
     ///
     /// 刻意不做缓存：分页结果与总数会随任意一次写入整体失效，命中率低而
     /// 失效成本高；真正的热点是单个用户详情，缓存收益远大于列表。
-    pub async fn get_users(
-        db: &PgPool,
-        page: i64,
-        page_size: i64,
-    ) -> Result<(Vec<User>, i64), AppError> {
+    pub async fn get_users(db: &PgPool, page: i64, page_size: i64) -> Result<(Vec<User>, i64), AppError> {
         let users = UserRepository::find_all(db, page, page_size).await?;
         let total = UserRepository::count(db).await?;
 
@@ -63,12 +48,8 @@ impl UserService {
     ///
     /// 采用 Cache-Aside（旁路缓存）模式：读请求先查 Redis，未命中再查数据库
     /// 并回填。缓存不可用时直接查库——它是加速层，不能成为接口可用性的前提。
-    pub async fn get_user_by_public_id(
-        db: &PgPool,
-        redis: &RedisStore,
-        public_id: Uuid,
-    ) -> Result<User, AppError> {
-        let key = redis.user_detail_key(public_id);
+    pub async fn get_user_by_public_id(db: &PgPool, redis: &RedisStore, public_id: Uuid) -> Result<User, AppError> {
+        let key = redis.key_user_detail(public_id);
 
         match redis.get_json::<User>(&key).await {
             Ok(Some(user)) => {
@@ -84,10 +65,7 @@ impl UserService {
             .ok_or(AppError::NotFound("用户不存在"))?;
 
         // 回填失败只告警：本次响应已经有正确数据，缓存写不进去不应变成 500。
-        if let Err(error) = redis
-            .set_json(&key, &user, redis.user_cache_ttl())
-            .await
-        {
+        if let Err(error) = redis.set_json(&key, &user, redis.user_cache_ttl()).await {
             tracing::warn!(%error, "回填用户缓存失败");
         }
 
@@ -95,12 +73,7 @@ impl UserService {
     }
 
     /// 更新用户
-    pub async fn update_user(
-        db: &PgPool,
-        redis: &RedisStore,
-        public_id: Uuid,
-        req: UpdateUserRequest,
-    ) -> Result<User, AppError> {
+    pub async fn update_user(db: &PgPool, redis: &RedisStore, public_id: Uuid, req: UpdateUserRequest) -> Result<User, AppError> {
         let user = UserRepository::update(db, public_id, req.email.as_deref(), req.nickname.as_deref())
             .await?
             .ok_or(AppError::NotFound("用户不存在"))?;
@@ -113,11 +86,7 @@ impl UserService {
     }
 
     /// 删除用户
-    pub async fn delete_user(
-        db: &PgPool,
-        redis: &RedisStore,
-        public_id: Uuid,
-    ) -> Result<(), AppError> {
+    pub async fn delete_user(db: &PgPool, redis: &RedisStore, public_id: Uuid) -> Result<(), AppError> {
         let deleted = UserRepository::delete(db, public_id).await?;
 
         if !deleted {
@@ -136,7 +105,7 @@ impl UserService {
 /// 决定缓存内容，而删除之后由下一次读请求回填，结果必然与数据库一致。
 /// 删除失败只告警——缓存键带 TTL，陈旧数据最多存活 `redis.user_cache_ttl_seconds`。
 async fn evict_user_cache(redis: &RedisStore, public_id: Uuid) {
-    let key = redis.user_detail_key(public_id);
+    let key = redis.key_user_detail(public_id);
 
     if let Err(error) = redis.delete(&key).await {
         tracing::warn!(%error, "删除用户缓存失败，陈旧数据将在 TTL 到期后自动失效");

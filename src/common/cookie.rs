@@ -3,14 +3,11 @@ use cookie::Cookie;
 
 use crate::config::CookieConfig;
 
-/// 从请求 Cookie 中读取 access token。
-pub fn access_token_from_headers(headers: &HeaderMap, config: &CookieConfig) -> Option<String> {
-    cookie_value(headers, &config.access_name)
-}
-
-/// 从请求 Cookie 中读取 refresh token。
-pub fn refresh_token_from_headers(headers: &HeaderMap, config: &CookieConfig) -> Option<String> {
-    cookie_value(headers, &config.refresh_name)
+/// 从请求 Cookie 中读取登录令牌。
+///
+/// 单令牌方案下只有一个 Cookie 需要读取：它同时承担认证与「登录还能用多久」。
+pub fn token_from_headers(headers: &HeaderMap, config: &CookieConfig) -> Option<String> {
+    cookie_value(headers, &config.name)
 }
 
 /// 按名称读取单个 Cookie 的值。
@@ -35,6 +32,9 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// 构建下发令牌的 `Set-Cookie` 头值。
 ///
+/// Cookie 名称直接取自配置，不接受调用方另行传入：名称只在一处定义，
+/// 下发与清除才不可能出现「名字写得不一致导致浏览器匹配不到」的问题。
+///
 /// 安全属性逐项说明：
 ///
 /// - `HttpOnly`：禁止页面脚本读取令牌，使 XSS 无法直接窃取凭据长期冒用。
@@ -44,8 +44,8 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 ///
 /// 刻意不设置 `Domain`：省略时浏览器按"仅当前主机"处理，可避免令牌被发送到
 /// 同一父域下的其他子域。
-pub fn build_token_cookie(config: &CookieConfig, name: &str, value: &str, max_age_seconds: i64) -> String {
-    Cookie::build((name.to_owned(), value.to_owned()))
+pub fn build_token_cookie(config: &CookieConfig, value: &str, max_age_seconds: i64) -> String {
+    Cookie::build((config.name.clone(), value.to_owned()))
         .path(config.path.clone())
         .http_only(true)
         .secure(config.secure)
@@ -59,8 +59,8 @@ pub fn build_token_cookie(config: &CookieConfig, name: &str, value: &str, max_ag
 ///
 /// 除空值与 `Max-Age=0` 外，其余属性必须与下发时完全一致：浏览器按
 /// 名称、域和路径匹配 Cookie，属性不一致会导致清除失败、令牌残留在客户端。
-pub fn build_clear_cookie(config: &CookieConfig, name: &str) -> String {
-    Cookie::build((name.to_owned(), String::new()))
+pub fn build_clear_cookie(config: &CookieConfig) -> String {
+    Cookie::build((config.name.clone(), String::new()))
         .path(config.path.clone())
         .http_only(true)
         .secure(config.secure)
@@ -87,8 +87,7 @@ mod tests {
 
     fn test_config() -> CookieConfig {
         CookieConfig {
-            access_name: "access_token".to_owned(),
-            refresh_name: "refresh_token".to_owned(),
+            name: "access_token".to_owned(),
             secure: false,
             same_site: "strict".to_owned(),
             path: "/".to_owned(),
@@ -102,31 +101,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_access_token_cookie() {
+    fn parses_token_cookie() {
         let headers = headers_with_cookie("access_token=abc.def.ghi; other=1");
 
-        assert_eq!(access_token_from_headers(&headers, &test_config()).as_deref(), Some("abc.def.ghi"));
-    }
-
-    #[test]
-    fn parses_refresh_token_cookie() {
-        let headers = headers_with_cookie("refresh_token=deadbeef");
-
-        assert_eq!(refresh_token_from_headers(&headers, &test_config()).as_deref(), Some("deadbeef"));
+        assert_eq!(token_from_headers(&headers, &test_config()).as_deref(), Some("abc.def.ghi"));
     }
 
     #[test]
     fn returns_none_when_cookie_absent() {
         let headers = headers_with_cookie("other=1");
 
-        assert!(access_token_from_headers(&headers, &test_config()).is_none());
+        assert!(token_from_headers(&headers, &test_config()).is_none());
     }
 
     #[test]
     fn returns_none_without_cookie_header() {
         let headers = HeaderMap::new();
 
-        assert!(access_token_from_headers(&headers, &test_config()).is_none());
+        assert!(token_from_headers(&headers, &test_config()).is_none());
     }
 
     /// 多个 Cookie 头并存时也要能找到令牌，避免中间件追加 Cookie 后认证失效。
@@ -136,7 +128,7 @@ mod tests {
         headers.append(axum::http::header::COOKIE, HeaderValue::from_static("first=1"));
         headers.append(axum::http::header::COOKIE, HeaderValue::from_static("access_token=found-me"));
 
-        assert_eq!(access_token_from_headers(&headers, &test_config()).as_deref(), Some("found-me"));
+        assert_eq!(token_from_headers(&headers, &test_config()).as_deref(), Some("found-me"));
     }
 
     /// 名称前缀相同的 Cookie 不能被误匹配。
@@ -144,12 +136,12 @@ mod tests {
     fn does_not_match_similar_cookie_name() {
         let headers = headers_with_cookie("access_token_extra=wrong");
 
-        assert!(access_token_from_headers(&headers, &test_config()).is_none());
+        assert!(token_from_headers(&headers, &test_config()).is_none());
     }
 
     #[test]
     fn sets_expected_security_attributes() {
-        let cookie = build_token_cookie(&test_config(), "access_token", "token-value", 900);
+        let cookie = build_token_cookie(&test_config(), "token-value", 900);
 
         assert!(cookie.starts_with("access_token=token-value"));
         assert!(cookie.contains("HttpOnly"), "必须设置 HttpOnly：{cookie}");
@@ -167,7 +159,7 @@ mod tests {
         let mut config = test_config();
         config.secure = true;
 
-        let cookie = build_token_cookie(&config, "access_token", "token-value", 900);
+        let cookie = build_token_cookie(&config, "token-value", 900);
 
         assert!(cookie.contains("Secure"), "启用后必须设置 Secure：{cookie}");
     }
@@ -177,7 +169,7 @@ mod tests {
         let mut config = test_config();
         config.same_site = "lax".to_owned();
 
-        let cookie = build_token_cookie(&config, "access_token", "token-value", 900);
+        let cookie = build_token_cookie(&config, "token-value", 900);
 
         assert!(cookie.contains("SameSite=Lax"), "应使用 Lax：{cookie}");
     }
@@ -187,7 +179,7 @@ mod tests {
     #[test]
     fn clear_cookie_matches_issued_attributes() {
         let config = test_config();
-        let cookie = build_clear_cookie(&config, "access_token");
+        let cookie = build_clear_cookie(&config);
 
         assert!(cookie.starts_with("access_token="));
         assert!(cookie.contains("Max-Age=0"), "必须立即过期：{cookie}");
@@ -201,7 +193,7 @@ mod tests {
         let mut config = test_config();
         config.secure = true;
 
-        let cookie = build_clear_cookie(&config, "refresh_token");
+        let cookie = build_clear_cookie(&config);
 
         assert!(cookie.contains("Secure"), "清除时必须与下发属性一致：{cookie}");
     }
@@ -209,7 +201,7 @@ mod tests {
     /// 令牌值不应被引号包裹，避免客户端拼接请求头时出现不一致。
     #[test]
     fn does_not_quote_token_value() {
-        let cookie = build_token_cookie(&test_config(), "access_token", "plain-token", 60);
+        let cookie = build_token_cookie(&test_config(), "plain-token", 60);
 
         assert!(!cookie.contains("\"plain-token\""), "令牌值不应被引号包裹：{cookie}");
     }

@@ -12,13 +12,13 @@
 - Axum：HTTP 路由、请求提取和响应转换。
 - Tokio：异步运行时及阻塞任务调度。
 - SQLx：PostgreSQL 连接池与数据访问。
-- Redis + bb8：登录失败计数、access token 吊销列表与用户资料缓存（见 [Redis 学习与项目实战指南](./REDIS_GUIDE.md)）。
+- Redis + bb8：登录失败计数、登录令牌吊销列表与用户资料缓存（见 [Redis 学习与项目实战指南](./REDIS_GUIDE.md)）。
 - Serde：请求、响应和配置的序列化与反序列化。
 - Validator：请求模型和查询参数的声明式校验。
 - config + dotenv：分环境配置加载。
 - tracing：结构化日志。
 - Argon2：密码哈希。
-- jsonwebtoken：签发与校验 access token（HS256）。11 起加密后端为可选特性，必须显式启用 `rust_crypto`（或 `aws_lc_rs`），否则首次签发会 panic。
+- jsonwebtoken：签发与校验登录令牌（HS256）。11 起加密后端为可选特性，必须显式启用 `rust_crypto`（或 `aws_lc_rs`），否则首次签发会 panic。
 - Utoipa + Swagger UI：从代码注解生成 OpenAPI 文档并提供交互式浏览入口。
 
 ## 2. 目录与职责
@@ -35,7 +35,7 @@ rust-axum-server/
     ├── config/             # 配置结构定义与加载逻辑
     ├── infrastructure/     # 外部依赖适配：PostgreSQL 连接池与 Redis 访问器
     ├── modules/            # 业务模块
-    │   ├── auth/           # 认证模块：登录、令牌刷新、登出、当前用户
+    │   ├── auth/           # 认证模块：登录、登出、当前用户
     │   ├── information/    # 聊天消息模块：会话、成员、消息、已读回执
     │   └── user/           # 用户模块
     └── main.rs             # 程序入口与启动流程
@@ -88,7 +88,7 @@ Redis 适配层（`infrastructure::redis`）与 Repository 处于同一层：Ser
 8. `RedisStore::from_config` 创建 Redis 访问器（连接池 + 键命名空间），并执行一次 `PING` 探测。创建失败（地址非法）终止启动；**只是连不上时不终止**，仅记录告警并继续——各功能都有降级路径，`/ready` 会把实例标记为未就绪，由编排系统决定是否接流量。这一取舍的完整说明见 [Redis 学习与项目实战指南](./REDIS_GUIDE.md) 第 6.4 节。
 9. `create_app` 创建 `AppState`（数据库连接池、Redis 访问器与认证配置），组装健康检查路由、API 路由和中间件。
 10. 根据主机与端口配置绑定 TCP 监听器。
-11. Axum 通过 `into_make_service_with_connect_info` 接管监听器并开始处理请求。使用带连接信息的服务是因为登录与刷新接口需要记录客户端 IP 用于安全审计。
+11. Axum 通过 `into_make_service_with_connect_info` 接管监听器并开始处理请求。使用带连接信息的服务是因为登录接口需要记录客户端 IP 用于安全审计。
 12. 任一启动步骤失败时，错误返回到 `main`，程序输出错误并以非零状态退出。`run` 返回 `anyhow::Result`，每个初始化步骤用 `.context("...")` 标注「哪一步失败」；`main` 用 `Debug` 而非 `Display` 打印，从而按 `Caused by` 逐层展开完整错误链（设置 `RUST_BACKTRACE` 时还带回溯）。启动期没有请求与响应，需要的是可读的因果链，而不是状态码。
 
 ```text
@@ -176,18 +176,19 @@ non-UTF-8 string for its error message.
 `/api/v1` 下的**全部接口默认需要登录**，认证由 `common::auth::require_login` 中间件在路由组上统一强制。以 `GET /api/v1/auth/me` 为例：
 
 1. 请求先经过 CORS 与日志中间件。
-2. 请求进入 `/api/v1` 路由组后先经过认证中间件。中间件从 `access_token` Cookie 读取 JWT，校验签名、签发者、有效期与 `typ` 声明，并把任何失败转换为统一的 `AppError::Unauthorized`（`401`，业务码 `40100`）。
+2. 请求进入 `/api/v1` 路由组后先经过认证中间件。中间件从令牌 Cookie 读取 JWT，校验签名、签发者、有效期与 `typ` 声明，并把任何失败转换为统一的 `AppError::Unauthorized`（`401`，业务码 `40100`）。
 3. 校验通过后，中间件用令牌的 `jti` 查询 Redis 吊销列表（`EXISTS`）：登出会把 `jti` 写入该列表，命中时返回 `401`「认证令牌已失效，请重新登录」。查询失败时记录告警并放行，退化为「令牌到期才失效」，避免 Redis 抖动把全部已登录用户踢下线。
 4. 中间件把用户身份写入请求扩展；Handler 再提取 `State`、`CurrentUser` 与业务参数，后续流程与匿名接口一致。
 5. `CurrentUser` 提取器只从请求扩展读取身份，不再次解析 Cookie。Handler 签名中出现 `CurrentUser` 表示该接口需要登录，身份来源由中间件保证。
 
-选择「中间件默认拒绝 + 显式白名单」而不是逐个 Handler 声明认证，原因是失效方向：漏写一处认证只会被评审发现，而默认拒绝会让任何新增接口天然受保护。白名单只有三项，且与路由注册共用同一组常量（`common::auth` 的 `LOGIN_PATH`、`REFRESH_PATH`、`LOGOUT_PATH`）：
+选择「中间件默认拒绝 + 显式白名单」而不是逐个 Handler 声明认证，原因是失效方向：漏写一处认证只会被评审发现，而默认拒绝会让任何新增接口天然受保护。白名单只有两项，且与路由注册共用同一组常量（`common::auth` 的 `LOGIN_PATH`、`LOGOUT_PATH`）：
 
 | 匿名可访问 | 不可移除的理由 |
 | --- | --- |
 | `POST /api/v1/auth/login` | 登录本身必须匿名，否则无法获得凭证 |
-| `POST /api/v1/auth/refresh` | access token 过期后客户端只剩刷新 Cookie，否则刷新流程永远无法启动 |
 | `POST /api/v1/auth/logout` | 登出必须幂等，令牌已失效时仍要能清理会话 |
+
+单令牌方案不需要 `POST /api/v1/auth/refresh`：令牌到期后客户端只能重新登录，因此白名单里也不应该出现第三个入口。`REFRESH_PATH` 常量已随接口一起删除，`/auth/refresh` 现在是一条不存在的路由，请求落到统一 `404`。
 
 两点实现约束：
 
@@ -200,35 +201,50 @@ non-UTF-8 string for its error message.
 
 认证模块位于 `src/modules/auth`，遵循与其他业务模块相同的分层结构。
 
-### 双令牌与 Cookie 下发
+### 单令牌与 Cookie 下发
 
-登录成功后签发两个令牌，均通过 `Set-Cookie` 响应头下发，**响应体不包含令牌**：
+登录成功后签发唯一的登录令牌，通过 `Set-Cookie` 响应头下发，**响应体不包含令牌**：
 
 | 令牌 | 格式 | 有效期 | 服务端状态 |
 | --- | --- | --- | --- |
-| access token | JWT（HS256） | 15 分钟 | 无状态；登出后按 `jti` 写入 Redis 吊销列表 |
-| refresh token | 256 位随机值 | 7 天 | 只存 SHA-256 摘要 |
+| 登录令牌 | JWT（HS256） | `jwt.ttl_minutes`，默认 7 天 | 无状态；登出后按 `jti` 写入 Redis 吊销列表 |
 
-Cookie 固定启用 `HttpOnly`，`Secure` 与 `SameSite` 由 `auth.cookie` 配置控制。`HttpOnly` 使页面脚本无法读取令牌，把 XSS 的影响限制为"代为发请求"，而无法长期窃取凭据。两个 Cookie 的 `Max-Age` 分别匹配各自令牌的有效期。
+Cookie 固定启用 `HttpOnly`，`Secure` 与 `SameSite` 由 `auth.cookie` 配置控制，名称由 `auth.cookie.name` 决定（默认 `access_token`）。`HttpOnly` 使页面脚本无法读取令牌，把 XSS 的影响限制为"代为发请求"，而无法长期窃取凭据。Cookie 的 `Max-Age` 等于令牌剩余有效期，两者不会出现一个失效另一个还在的错位。
 
-`AuthService::TokenPair` 刻意不派生 `Serialize`：令牌在类型上不可序列化，从代码层面杜绝被误放进 JSON 响应。
+`AuthService::IssuedToken` 刻意不派生 `Serialize`：令牌在类型上不可序列化，从代码层面杜绝被误放进 JSON 响应。
 
-### 令牌轮换与重放检测
+### 为什么只有一个令牌
 
-`/auth/refresh` 采用轮换策略：每次刷新签发新的 refresh token，并把旧会话标记为已吊销、在 `replaced_by` 中记录轮换关系。
+双令牌（短期 access + 长期 refresh）解决的是「既想要长免登录，又想要短泄露窗口」的矛盾，代价是配套的轮换、重放检测、两个 Cookie、两个有效期和一个匿名刷新接口。本项目的取舍是**一个有效期较长的令牌 + 到期重新登录**：
 
-已吊销的 refresh token 再次被使用会被判定为泄露重放，服务端随即吊销该用户的全部会话。此时无法分辨攻击者与合法用户，只能让双方都重新登录——这是"宁可多一次登录，也不允许泄露令牌继续可用"的取舍。
+- 认证路径只有一条（校验签名 → 查 Redis 吊销列表），没有第二套续期分支需要同步维护；
+- 匿名白名单只剩登录与登出，少一个可被滥用的入口；
+- 令牌最长可用时间等于 `jwt.ttl_minutes` 这个可配置的单一数字，需要更严格时直接调小，而不是增加刷新逻辑。
+
+残余风险是明确的：令牌泄露后最长可用 `ttl_minutes`（默认 7 天），期间服务端无法区分攻击者与合法用户。缓解手段只有三种——缩短 TTL、修改密码后让用户重新登录、以及在检测到异常时人工吊销 `jti`。
+
+### 过期即重新登录
+
+令牌过期后中间件返回 `401 认证令牌已过期，请重新登录`。这不是可以自动续期的中间状态：**项目没有刷新接口，客户端唯一的正确动作是引导用户重新登录**。登录响应体中的 `expires_in` 只用于提前提示，真正的判定始终是服务端的 `401`。
+
+### 登录会话表只承担审计
+
+`user_sessions` 表在单令牌方案下**不参与每次请求的认证**：中间件为了认证不会查询它。登录时写入一条记录（`token_hash` 是令牌的 SHA-256 摘要，不是令牌本身），登出时按摘要定位并标记 `revoked_at`。它回答「谁在什么时候、从哪个 IP 和客户端登录过、何时结束」。
+
+这条边界必须明确：认证的正确性只取决于 JWT 签名与 Redis 吊销列表；反过来，手工把某条记录标为已吊销并不会让令牌下线，下线必须走 Redis 吊销。`replaced_by` 列属于已下线的轮换机制，保留仅为兼容历史数据。
 
 ### 登出语义的边界
 
-登出会同时处理两类凭据：
+登出会处理两件事：
 
-- **refresh token**：会话落库，登出即吊销记录（`revoked_at`），之后无法再续期；
-- **access token**：本身无状态，登出时把令牌的 `jti` 写入 Redis 吊销列表（`SET ... EX`，TTL 等于令牌剩余有效期），认证中间件随后用 `EXISTS` 拦截已吊销的令牌。因此**登出后 access token 立即失效**，不必再等 15 分钟。
+- **会话审计记录**：按令牌摘要定位并标记 `revoked_at`（`AuthService::logout`），即使令牌已经过期也能定位——查找只用摘要、不解析令牌；
+- **登录令牌**：本身无状态，登出时把令牌的 `jti` 写入 Redis 吊销列表（`SET ... EX`，TTL 等于令牌剩余有效期），认证中间件随后用 `EXISTS` 拦截已吊销的令牌。因此**登出后令牌立即失效**，不必再等它自然过期。
 
-吊销检查依赖 Redis，失败时按「未吊销」放行并告警：此时退化为「令牌到期才失效」，与引入 Redis 之前的行为一致。这是「登出立即生效」的增强，而不是认证正确性的前提。
+两步都是尽力而为：任一步失败只记录告警，仍然清除客户端 Cookie。让客户端卡在"无法退出"的状态比一次吊销失败更糟。
 
-access token 自然过期后，对应的吊销记录也会随 TTL 消失，不会无限累积。
+吊销检查依赖 Redis，失败时按「未吊销」放行并告警：此时退化为「令牌到期才失效」。单令牌方案的 TTL 较长，这个退化窗口比双令牌方案更大，因此生产环境应把 Redis 视为认证链路的一部分，`/ready` 在 Redis 不可用时返回 `503`。
+
+令牌自然过期后，对应的吊销记录也会随 TTL 消失，不会无限累积。
 
 ### 登录保护
 
@@ -268,7 +284,7 @@ Cookie 会自动随请求发送，因此必须防 CSRF。主要防线是 `SameSi
 
 - 日志中间件：记录方法、URI、响应状态和处理耗时。
 - CORS 中间件：当前允许任意来源、方法和请求头，便于开发联调；生产环境应根据实际前端域名收紧规则。若前端与后端跨源部署，**必须启用凭据支持并指定具体来源**，因为浏览器不会在通配来源下携带 Cookie。
-- 认证中间件（`common::auth::require_login`）：只作用于 `/api/v1` 路由组中已匹配到路由的请求，按白名单放行认证入口，其余请求一律要求有效的 access token Cookie。
+- 认证中间件（`common::auth::require_login`）：只作用于 `/api/v1` 路由组中已匹配到路由的请求，按白名单放行登录与登出，其余请求一律要求有效的令牌 Cookie。
 
 中间件的挂载顺序会影响失败响应：认证中间件在内层，因此 `/api/v1` 下未登录的请求先得到 `401`，不会落到外层的 404、405 fallback。
 
@@ -305,9 +321,10 @@ Cookie 会自动随请求发送，因此必须防 CSRF。主要防线是 `SameSi
 
 - 密码仅以 Argon2 哈希形式写入数据库，API 响应和查询字段均不包含 `password_hash`。认证查询通过独立的 `UserCredentials` 类型返回凭证，该类型不派生 `Serialize` 与 `ToSchema`；把 `password_hash` 挂到公开的 `User` 上会使其顺着响应序列化和 OpenAPI Schema 一起对外暴露，类型分离是这里唯一可靠的防线。
 - 引导账号只在 `users` 表为空且配置开关开启时创建，用于解开「登录需要用户、建用户需要登录」的死锁。它不是默认口令：开关默认关闭、只对空表生效、执行后即可关闭，且凭据只能来自未提交的本地配置或环境变量。
-- 令牌通过 `HttpOnly` Cookie 下发，响应体不携带令牌；access token 与 refresh token 使用不同有效期，Cookie 的 `Max-Age` 分别匹配。
-- refresh token 只保存 SHA-256 摘要，数据库泄露时无法反推出可用令牌；因其本身是 256 位随机值，不存在字典攻击空间，无需使用慢速哈希。
-- access token 的吊销记录存放在 Redis，TTL 等于令牌剩余有效期：只保存 `jti`，不保存令牌本身，Redis 泄露也无法据此伪造令牌。
+- 令牌通过 `HttpOnly` Cookie 下发，响应体不携带令牌；Cookie 的 `Max-Age` 等于令牌剩余有效期，名称只有一处定义（`auth.cookie.name`），下发与清除共用。
+- 登录令牌只签发一个，有效期由 `jwt.ttl_minutes` 控制（默认 7 天），到期后必须重新登录：项目不提供刷新接口，也不存在第二个续期凭据。
+- 登录会话记录只承担审计职责，`token_hash` 保存令牌的 SHA-256 摘要；数据库泄露时无法反推出可用令牌，且该表不参与每次请求的认证。
+- 令牌的吊销记录存放在 Redis，TTL 等于令牌剩余有效期：只保存 `jti`，不保存令牌本身，Redis 泄露也无法据此伪造令牌。
 - 登录失败计数存放在 Redis 有序集合中（滑动窗口），数据库 `login_failures` 表只承担审计职责；Redis 不可用时判定自动回退到该表，不会出现「限流静默失效」。
 - Redis 只保存可以重建的数据：登录失败计数、短期吊销记录、用户资料缓存。任何无法从数据库重建的数据都不应进入 Redis。
 - 用户采用内部 `BIGINT IDENTITY` 主键与公开 UUIDv7 双 ID。内部主键用于数据库关联和排序，不通过 API 暴露；UUIDv7 由 Service 在创建用户时生成，作为接口路径、响应和跨系统传递使用的稳定标识。认证令牌的 `sub` 使用内部主键，使受保护接口可直接命中主键索引。
@@ -316,7 +333,7 @@ Cookie 会自动随请求发送，因此必须防 CSRF。主要防线是 `SameSi
 - 健康检查 `/health` 只表示进程可响应；就绪检查 `/ready` 会探测数据库与 Redis，两者任一不可用即返回 `503`，避免「降级运行」的实例继续接收流量。
 - Redis 键统一带 `redis.key_prefix` 命名空间（如 `axum:auth:login_failures:<username>`），多环境共用一个实例时互不干扰；配置校验拒绝空前缀。
 - 数据库结构通过 `migrations` 目录中的脚本维护；迁移脚本会在编译时嵌入程序，并在服务启动、开始监听端口前自动执行。
-- 已发布或可能已执行的结构变更应新增迁移文件，不直接修改历史迁移；任何迁移失败都会中止服务启动。认证相关表通过 `002_create_auth_tables.sql` 新增，聊天相关表通过 `003_create_information_tables.sql` 新增，`004_sync_users_disabled_columns.sql` 以幂等 ALTER 为早期已存在的 `users` 表补齐 `is_disabled` / `disabled_at`，均未改动更早的迁移。
+- 已发布或可能已执行的结构变更应新增迁移文件，不直接修改历史迁移；任何迁移失败都会中止服务启动。认证相关表通过 `002_create_auth_tables.sql` 新增，聊天相关表通过 `003_create_information_tables.sql` 新增；`004_document_single_token_sessions.sql` 不改结构，只用 `COMMENT` 说明单令牌方案下 `user_sessions` 已降级为审计表。
 - 聊天数据的归属判断写在 SQL 里：查询消息与会话时都用 `JOIN conversation_members ... AND user_id = $n` 过滤，非成员得到的是「查不到」而不是「查到了但不属于你」。归属因此是数据访问层的结果，而不是业务层的一个 `if`——后者每新增一个查询方法就多一次漏写的可能，且数据已经进入应用内存，日志与调试输出都可能把它带出去。
 - 会话内消息序号（`messages.seq`）独立于自增主键：自增主键是全局的，对外暴露会泄露「全站一共发了多少条消息」，而会话内序号只暴露该会话自身的规模，且正是聊天客户端需要的分页游标。
 

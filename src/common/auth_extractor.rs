@@ -47,15 +47,13 @@ mod tests {
             jwt: Arc::new(JwtConfig {
                 secret: "unit-test-secret-with-enough-length-32".to_owned(),
                 issuer: "rust-axum-server-test".to_owned(),
-                access_ttl_minutes: 15,
-                refresh_ttl_days: 7,
+                ttl_minutes: 10_080,
             }),
             auth: Arc::new(AuthConfig {
                 max_login_failures: 5,
                 login_window_minutes: 15,
                 cookie: CookieConfig {
-                    access_name: "access_token".to_owned(),
-                    refresh_name: "refresh_token".to_owned(),
+                    name: "access_token".to_owned(),
                     secure: false,
                     same_site: "strict".to_owned(),
                     path: "/".to_owned(),

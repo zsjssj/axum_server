@@ -109,7 +109,7 @@ let password_hash = tokio::task::spawn_blocking(move || hash_password(&password)
 ```
 
 ```rust
-// src/modules/auth/service.rs:504  登录时校验密码
+// src/modules/auth/service.rs:369  登录时校验密码
 async fn verify_password(password: &str, encoded_hash: &str) -> Result<bool, AppError> {
     let password = password.to_owned();          // 必须 move 进去：'static 约束
     let encoded_hash = encoded_hash.to_owned();
@@ -143,14 +143,13 @@ pub enum AppError {
 
 ```rust
 // src/modules/auth/model.rs:27  刻意"不能序列化"的类型
-pub struct TokenPair {
-    pub access_token: String,
-    pub refresh_token: String,
+pub struct IssuedToken {
+    pub token: String,
     pub expires_in: i64,
 }
 ```
 
-`TokenPair` 没有派生 `Serialize`。这意味着**任何**把它放进 JSON 响应的代码都编译不过。令牌只允许通过 `Set-Cookie` 头下发，这条安全约束不靠 code review，靠类型系统。同样的手法用在 `UserCredentials`（`src/modules/user/model.rs:33`）上：它装着 `password_hash`，但因为没有 `Serialize` 和 `ToSchema`，密码哈希没有进入响应或接口文档的路径。
+`IssuedToken` 没有派生 `Serialize`。这意味着**任何**把它放进 JSON 响应的代码都编译不过。令牌只允许通过 `Set-Cookie` 头下发，这条安全约束不靠 code review，靠类型系统。同样的手法用在 `UserCredentials`（`src/modules/user/model.rs:33`）上：它装着 `password_hash`，但因为没有 `Serialize` 和 `ToSchema`，密码哈希没有进入响应或接口文档的路径。
 
 ```rust
 // src/modules/user/model.rs:13  一个类型同时承担"数据库行"和"缓存值"
@@ -226,7 +225,7 @@ pub struct AppState {
 | `Result` | 错误必须显式处理或上抛 | `AppError` + `From` 实现 + `?` |
 | `Future` 惰性 | 不 `.await` 就不执行；阻塞会拖死执行器 | `spawn_blocking` 处理密码哈希 |
 | `enum` 带数据 | 用类型表达"有哪些失败/状态" | `AppError`、`ApiCode` |
-| trait 派生 = 开出口 | 派生 `Serialize` 等于允许它进 JSON | `TokenPair`、`UserCredentials` 不派生 |
+| trait 派生 = 开出口 | 派生 `Serialize` 等于允许它进 JSON | `IssuedToken`、`UserCredentials` 不派生 |
 | 模块可见性 | 模块树就是架构边界 | `pub(crate)` Handler、`pub use routes` |
 | `Clone` 语义 | 便宜克隆靠共享句柄，不靠复制数据 | `AppState` 每请求克隆 |
 
@@ -234,7 +233,7 @@ pub struct AppState {
 
 1. **观察惰性**：新建 `examples/lazy.rs`，写一个 `async fn`，里面 `println!` 一句，只在 `main` 里调用而不 `.await`，观察什么都不打印；再 `.await` 一次。
 2. **体会阻塞的代价**：把 `src/modules/user/service.rs:25` 的 `spawn_blocking` 临时改成直接调用 `hash_password(&password)?`。写一个 20 并发的压测（`for` 循环 + `tokio::spawn` 调创建用户接口），对比响应时间。**改完记得还原。**
-3. **验证类型防线**：给 `TokenPair` 临时加 `#[derive(serde::Serialize)]`，然后在 `handler.rs` 里把 body 改成 `Json(tokens)`，看编译能不能过——它能过，但说明你刚刚给自己开了一条泄露通道。删掉。
+3. **验证类型防线**：给 `IssuedToken` 临时加 `#[derive(serde::Serialize)]`，然后在 `handler.rs` 里把 body 改成 `Json(issued)`，看编译能不能过——它能过，但说明你刚刚给自己开了一条泄露通道。删掉。
 4. **读一遍** `src/common/error.rs` 全文，不看注释，自己说出每个变体对应哪个 HTTP 状态码，再和文件里的 `IntoResponse` 对照。
 
 ## 1.9 自测题

@@ -16,7 +16,7 @@
 //! | 用途 | 数据类型 | 过期策略 |
 //! | --- | --- | --- |
 //! | 登录失败计数 | ZSET（按失败时间打分） | 整个键带 TTL，读取时修剪窗口外成员 |
-//! | access token 吊销列表 | STRING | TTL 等于令牌剩余有效期，到期即自动清理 |
+//! | 登录令牌吊销列表 | STRING | TTL 等于令牌剩余有效期，到期即自动清理 |
 //! | 用户资料缓存 | STRING（JSON） | 固定 TTL + 写操作主动删除 |
 
 use crate::config::RedisConfig;
@@ -144,13 +144,12 @@ impl RedisStore {
         // 因为前面 type RedisPool = Pool<Client>; 所以此处 RedisPool::builder()等效于 Pool::builder()，
         let pool = RedisPool::builder()
             .max_size(config.pool_size)
-            .connection_timeout(Duration::from_secs(5))
+            .connection_timeout(Duration::from_secs(config.connection_timeout_seconds.max(10)))
             .build_unchecked(client);
-
         Ok(Self {
             pool,
             key_prefix: normalize_prefix(&config.key_prefix),
-            user_cache_ttl: Duration::from_secs(config.user_cache_ttl_seconds.max(1) as u64),
+            user_cache_ttl: Duration::from_secs(config.user_cache_ttl_seconds.max(1)),
         })
     }
 
@@ -175,7 +174,7 @@ impl RedisStore {
 
     /// 统计滑动窗口内的登录失败次数。
     pub async fn login_failure_count(&self, username: &str, window: Duration) -> Result<i64, RedisStoreError> {
-        let key = self.login_failure_key(username);
+        let key = self.key_login_failure(username);
         let mut connection = self.connection().await?;
 
         LOGIN_FAILURE_COUNT_SCRIPT
@@ -189,7 +188,7 @@ impl RedisStore {
 
     /// 记录一次登录失败，返回记录后窗口内的失败次数。
     pub async fn record_login_failure(&self, username: &str, window: Duration) -> Result<i64, RedisStoreError> {
-        let key = self.login_failure_key(username);
+        let key = self.key_login_failure(username);
         // 成员用 UUIDv7：同一毫秒内的两次失败也不会互相覆盖。
         // 计数的精度依赖成员唯一，这里不能退化成「时间戳作为成员」。
         let member = Uuid::now_v7().to_string();
@@ -212,7 +211,7 @@ impl RedisStore {
     /// 用 `SET ... EX` 单条命令写入，避免 `SET` 成功、`EXPIRE` 失败时
     /// 留下一个永不过期的键。
     pub async fn revoke_access_token(&self, jti: &str, ttl: Duration) -> Result<(), RedisStoreError> {
-        let key = self.revoked_access_key(jti);
+        let key = self.key_revoked_access(jti);
         let mut connection = self.connection().await?;
 
         connection
@@ -223,13 +222,11 @@ impl RedisStore {
 
     /// 查询 access token 是否已被吊销。
     pub async fn is_access_token_revoked(&self, jti: &str) -> Result<bool, RedisStoreError> {
-        let key = self.revoked_access_key(jti);
+        let key = self.key_revoked_access(jti);
         let mut connection = self.connection().await?;
-
         // 用 `EXISTS` 而不是 `GET`：吊销记录只关心「在不在」，
         // 读取内容没有任何意义，`EXISTS` 也不受值类型的影响。
         let exists: i64 = connection.exists(&key).await.map_err(RedisStoreError::Command)?;
-
         Ok(exists > 0)
     }
 
@@ -237,7 +234,6 @@ impl RedisStore {
     pub async fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, RedisStoreError> {
         let mut connection = self.connection().await?;
         let raw: Option<String> = connection.get(key).await.map_err(RedisStoreError::Command)?;
-
         match raw {
             Some(raw) => serde_json::from_str(&raw).map(Some).map_err(RedisStoreError::Serde),
             None => Ok(None),
@@ -258,30 +254,25 @@ impl RedisStore {
     /// 删除一个缓存键。
     pub async fn delete(&self, key: &str) -> Result<(), RedisStoreError> {
         let mut connection = self.connection().await?;
-
         connection.del::<_, ()>(key).await.map_err(RedisStoreError::Command)
     }
 
     /// 登录失败计数键。
-    pub fn login_failure_key(&self, username: &str) -> String {
+    pub fn key_login_failure(&self, username: &str) -> String {
         self.namespaced(&format!("auth:login_failures:{username}"))
     }
-
-    /// access token 吊销记录键。
-    pub fn revoked_access_key(&self, jti: &str) -> String {
+    /// 登录令牌吊销记录键。
+    pub fn key_revoked_access(&self, jti: &str) -> String {
         self.namespaced(&format!("auth:revoked_access:{jti}"))
     }
-
     /// 用户资料缓存键。
-    pub fn user_detail_key(&self, public_id: Uuid) -> String {
+    pub fn key_user_detail(&self, public_id: Uuid) -> String {
         self.namespaced(&format!("user:detail:{public_id}"))
     }
-
     /// 拼接命名空间前缀。
     fn namespaced(&self, key: &str) -> String {
         format!("{}:{key}", self.key_prefix)
     }
-
     /// 从连接池取得一条连接。
     async fn connection(&self) -> Result<bb8::PooledConnection<'_, Client>, RedisStoreError> {
         self.pool.get().await.map_err(|error| match error {
@@ -318,6 +309,7 @@ impl RedisStore {
             pool_size: 2,
             key_prefix: "test".to_owned(),
             user_cache_ttl_seconds: 60,
+            connection_timeout_seconds: 5,
         })
         .expect("测试用 Redis 配置必须合法")
     }
@@ -333,6 +325,7 @@ mod tests {
             pool_size: 2,
             key_prefix: prefix.to_owned(),
             user_cache_ttl_seconds: 60,
+            connection_timeout_seconds: 5,
         })
         .expect("测试用 Redis 配置必须合法")
     }
@@ -344,9 +337,9 @@ mod tests {
         let public_id = Uuid::now_v7();
 
         for key in [
-            store.login_failure_key("alice"),
-            store.revoked_access_key("jti-1"),
-            store.user_detail_key(public_id),
+            store.key_login_failure("alice"),
+            store.key_revoked_access("jti-1"),
+            store.key_user_detail(public_id),
         ] {
             assert!(key.starts_with("axum:"), "键必须以命名空间开头：{key}");
         }
@@ -357,9 +350,9 @@ mod tests {
     async fn key_categories_do_not_collide() {
         let store = store("axum");
 
-        assert_eq!(store.login_failure_key("u1"), "axum:auth:login_failures:u1");
-        assert_eq!(store.revoked_access_key("abc"), "axum:auth:revoked_access:abc");
-        assert_ne!(store.login_failure_key("x"), store.revoked_access_key("x"));
+        assert_eq!(store.key_login_failure("u1"), "axum:auth:login_failures:u1");
+        assert_eq!(store.key_revoked_access("abc"), "axum:auth:revoked_access:abc");
+        assert_ne!(store.key_login_failure("x"), store.key_revoked_access("x"));
     }
 
     /// 前缀首尾的空白与冒号必须被归一化，否则会出现 `axum::...` 这种键。
@@ -369,7 +362,7 @@ mod tests {
             let store = store(prefix);
 
             assert_eq!(
-                store.login_failure_key("u1"),
+                store.key_login_failure("u1"),
                 "axum:auth:login_failures:u1",
                 "前缀 {prefix:?} 应被规范化为 axum"
             );
@@ -382,7 +375,7 @@ mod tests {
         let dev = store("dev");
         let prod = store("prod");
 
-        assert_ne!(dev.user_detail_key(Uuid::nil()), prod.user_detail_key(Uuid::nil()));
+        assert_ne!(dev.key_user_detail(Uuid::nil()), prod.key_user_detail(Uuid::nil()));
     }
 
     /// 缓存 TTL 来自配置，且不会因为配置为 0 变成「永不过期」。
@@ -423,6 +416,7 @@ mod tests {
             pool_size: 2,
             key_prefix: "axum".to_owned(),
             user_cache_ttl_seconds: 60,
+            connection_timeout_seconds: 5,
         });
 
         match result {

@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 
 use crate::app::state::AppState;
 use crate::common::{
-    auth::{LOGIN_PATH, LOGOUT_PATH, REFRESH_PATH},
+    auth::{LOGIN_PATH, LOGOUT_PATH},
     auth_extractor::CurrentUser,
     cookie::{self, build_clear_cookie, build_token_cookie},
     error::{AppError, ErrorData},
@@ -18,20 +18,22 @@ use crate::common::{
 };
 use crate::config::CookieConfig;
 use crate::modules::auth::{
-    model::{AuthSessionResponse, CurrentUserResponse, LoginRequest, TokenPair},
+    model::{AuthSessionResponse, CurrentUserResponse, IssuedToken, LoginRequest},
     service::{AuthService, LoginContext},
 };
 
 /// 认证路由。
 ///
 /// 统一挂载在 `app::routes::api_routes` 的 `/api/v1` 前缀之下；这里使用相对路径，
-/// 其中三个认证入口直接引用 `common::auth` 中的白名单常量，使「注册的路由」与
+/// 其中两个认证入口直接引用 `common::auth` 中的白名单常量，使「注册的路由」与
 /// 「匿名放行的白名单」共用同一个定义——两处分叉会直接导致客户端无法登录，
 /// 或某个受保护路径被意外放行。
+///
+/// 单令牌方案只提供登录、登出与当前用户三个入口：没有 `/auth/refresh`，
+/// 令牌到期后服务端返回 `401`，客户端据 `expires_in` 或该响应引导用户重新登录。
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(LOGIN_PATH, post(login))
-        .route(REFRESH_PATH, post(refresh_token))
         .route(LOGOUT_PATH, post(logout))
         .route("/auth/me", get(current_user))
 }
@@ -66,38 +68,19 @@ struct ClientInfo {
 /// 构建携带令牌 Cookie 的成功响应。
 ///
 /// 令牌只出现在 `Set-Cookie` 响应头中，响应体不含令牌本身。
-fn session_response(
-    cookie_config: &CookieConfig,
-    tokens: TokenPair,
-    refresh_ttl_seconds: i64,
-    message: &'static str,
-) -> Result<axum::response::Response, AppError> {
+/// `Max-Age` 直接取自令牌剩余有效期：单令牌方案下 Cookie 的生命周期与令牌
+/// 完全一致，不存在「Cookie 还在、令牌已失效」的中间状态。
+fn session_response(cookie_config: &CookieConfig, issued: IssuedToken, message: &'static str) -> Result<axum::response::Response, AppError> {
     let mut headers = HeaderMap::new();
-    // 两个 Cookie 的 Max-Age 必须各自匹配其令牌有效期，不能共用：
-    // 若 access token 的 Cookie 沿用刷新令牌的有效期，它会在令牌实际失效后
-    // 仍被浏览器持续发送，让服务端反复处理注定失败的请求。
-    append_set_cookie(
-        &mut headers,
-        build_token_cookie(cookie_config, &cookie_config.access_name, &tokens.access_token, tokens.expires_in),
-    )?;
-    append_set_cookie(
-        &mut headers,
-        build_token_cookie(cookie_config, &cookie_config.refresh_name, &tokens.refresh_token, refresh_ttl_seconds),
-    )?;
-    let body = ApiResponse::success(
-        message,
-        AuthSessionResponse::new(tokens.expires_in, &cookie_config.access_name, &cookie_config.refresh_name),
-    );
+    append_set_cookie(&mut headers, build_token_cookie(cookie_config, &issued.token, issued.expires_in))?;
+    let body = ApiResponse::success(message, AuthSessionResponse::new(issued.expires_in));
     Ok((headers, Json(body)).into_response())
 }
 
 /// 构建清除令牌 Cookie 的成功响应。
 fn cleared_session_response(cookie_config: &CookieConfig, message: &'static str) -> Result<axum::response::Response, AppError> {
     let mut headers = HeaderMap::new();
-    // 无论当前请求带了哪些 Cookie，两个都要清除：
-    // 否则未清除的那个令牌会残留在浏览器中继续可用，登出形同未完成。
-    append_set_cookie(&mut headers, build_clear_cookie(cookie_config, &cookie_config.access_name))?;
-    append_set_cookie(&mut headers, build_clear_cookie(cookie_config, &cookie_config.refresh_name))?;
+    append_set_cookie(&mut headers, build_clear_cookie(cookie_config))?;
     let body = ApiResponse::<()>::success_without_data(message);
     Ok((headers, Json(body)).into_response())
 }
@@ -109,12 +92,10 @@ fn append_set_cookie(headers: &mut HeaderMap, value: String) -> Result<(), AppEr
     Ok(())
 }
 
-/// 将刷新令牌的有效期转换为秒。
-fn refresh_ttl_seconds(state: &AppState) -> i64 {
-    state.jwt.refresh_ttl_days * 24 * 60 * 60
-}
-
 /// 用户登录
+///
+/// 成功时签发唯一的登录令牌，并通过 `Set-Cookie` 下发；响应体只包含
+/// 「令牌还有多少秒到期」，客户端据此决定何时提示用户重新登录。
 #[utoipa::path(
     post,
     path = "/api/v1/auth/login",
@@ -137,7 +118,7 @@ pub(crate) async fn login(
     ValidatedJson(req): ValidatedJson<LoginRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let client = client_info(&headers, client_addr.0);
-    let tokens = AuthService::login(
+    let issued = AuthService::login(
         &state.db,
         &state.redis,
         &state.jwt,
@@ -150,34 +131,19 @@ pub(crate) async fn login(
         },
     )
     .await?;
-    session_response(&state.auth.cookie, tokens, refresh_ttl_seconds(&state), "登录成功")
-}
-
-/// 刷新令牌
-#[utoipa::path(
-    post,
-    path = "/api/v1/auth/refresh",
-    tag = "认证",
-    responses(
-        (status = 200, description = "刷新成功，新令牌通过 Set-Cookie 响应头下发", body = ApiResponse<AuthSessionResponse>),
-        (status = 401, description = "刷新令牌无效、已过期或已被使用", body = ApiResponse<ErrorData>),
-        (status = 500, description = "服务器内部错误", body = ApiResponse<ErrorData>)
-    )
-)]
-pub(crate) async fn refresh_token(State(state): State<AppState>, client_addr: ClientAddr, headers: HeaderMap) -> Result<impl IntoResponse, AppError> {
-    let client = client_info(&headers, client_addr.0);
-    let refresh_token = cookie::refresh_token_from_headers(&headers, &state.auth.cookie).ok_or(AppError::Unauthorized("缺少刷新令牌"))?;
-    let tokens = AuthService::refresh(&state.db, &state.jwt, &refresh_token, client.ip.as_deref(), client.user_agent.as_deref()).await?;
-    session_response(&state.auth.cookie, tokens, refresh_ttl_seconds(&state), "刷新成功")
+    session_response(&state.auth.cookie, issued, "登录成功")
 }
 
 /// 用户登出
 ///
-/// 登出需要撤销两类凭据，顺序是先吊销刷新令牌会话，再把当前 access token
-/// 写入吊销列表：
+/// 单令牌方案下需要撤销两类状态，顺序是先标记会话审计记录，再把令牌写入
+/// Redis 吊销列表：
 ///
-/// - 刷新令牌会话落库，必须吊销，否则攻击者可以继续续期；
-/// - access token 无状态，只能借助 Redis 吊销列表在自然过期前失效。
+/// - 会话记录落库，标记吊销后可以回答「这次会话何时结束」；
+/// - 令牌本身无状态，只能借助 Redis 吊销列表在自然过期前失效。
+///
+/// 令牌是唯一的凭据，因此这两步都以同一个 Cookie 为输入：Cookie 缺失时
+/// 没有任何东西需要吊销，直接清除即可返回成功。
 ///
 /// 两次吊销都是「尽力而为」：任何一步失败都只记录告警并继续清除 Cookie。
 /// 让客户端卡在"无法退出"的状态比一次吊销失败更糟，而且 Cookie 清除本身
@@ -192,17 +158,13 @@ pub(crate) async fn refresh_token(State(state): State<AppState>, client_addr: Cl
     )
 )]
 pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<impl IntoResponse, AppError> {
-    if let Some(refresh_token) = cookie::refresh_token_from_headers(&headers, &state.auth.cookie)
-        && let Err(error) = AuthService::logout(&state.db, &refresh_token).await
-    {
-        tracing::warn!(?error, "登出时吊销会话失败，仍继续清除客户端 Cookie");
-    }
-    // access token 可能因浏览器只发送了部分 Cookie 而缺失，此时只清理刷新令牌会话。
-    // 吊销写入失败同样不阻断登出：Redis 故障时退化为「令牌到期才失效」。
-    if let Some(access_token) = cookie::access_token_from_headers(&headers, &state.auth.cookie)
-        && let Err(error) = AuthService::revoke_access_token(&state.redis, &state.jwt, &access_token).await
-    {
-        tracing::warn!(?error, "登出时写入 access token 吊销列表失败，令牌将在自然过期前继续有效");
+    if let Some(token) = cookie::token_from_headers(&headers, &state.auth.cookie) {
+        if let Err(error) = AuthService::logout(&state.db, &token).await {
+            tracing::warn!(?error, "登出时吊销会话审计记录失败，仍继续清除客户端 Cookie");
+        }
+        if let Err(error) = AuthService::revoke_access_token(&state.redis, &state.jwt, &token).await {
+            tracing::warn!(?error, "登出时写入令牌吊销列表失败，令牌将在自然过期前继续有效");
+        }
     }
     // 即使没有令牌也返回成功：登出是幂等操作，
     // 重复调用或 Cookie 已缺失都不应让客户端收到错误。
@@ -231,8 +193,7 @@ mod tests {
 
     fn test_cookie_config() -> CookieConfig {
         CookieConfig {
-            access_name: "access_token".to_owned(),
-            refresh_name: "refresh_token".to_owned(),
+            name: "access_token".to_owned(),
             secure: false,
             same_site: "strict".to_owned(),
             path: "/".to_owned(),
@@ -247,18 +208,17 @@ mod tests {
             .collect()
     }
 
-    /// 登录响应必须同时下发两个 Cookie。
+    /// 登录响应只下发一个 Cookie：单令牌方案下不存在第二个凭据。
     #[test]
-    fn login_sets_both_token_cookies() {
+    fn login_sets_a_single_token_cookie() {
         let config = test_cookie_config();
-        let tokens = TokenPair::new("access-value".to_owned(), "refresh-value".to_owned(), 900);
+        let issued = IssuedToken::new("token-value".to_owned(), 604_800);
 
-        let response = session_response(&config, tokens, 604_800, "登录成功").expect("响应应构造成功");
+        let response = session_response(&config, issued, "登录成功").expect("响应应构造成功");
         let cookies = collect_set_cookies(response.headers());
 
-        assert_eq!(cookies.len(), 2, "应下发两个 Set-Cookie：{cookies:?}");
-        assert!(cookies.iter().any(|c| c.starts_with("access_token=access-value")));
-        assert!(cookies.iter().any(|c| c.starts_with("refresh_token=refresh-value")));
+        assert_eq!(cookies.len(), 1, "应只下发一个 Set-Cookie：{cookies:?}");
+        assert!(cookies[0].starts_with("access_token=token-value"));
     }
 
     /// 令牌不得出现在响应体中，否则 HttpOnly 的防护意义会被完全绕过。
@@ -267,46 +227,41 @@ mod tests {
         use http_body_util::BodyExt;
 
         let config = test_cookie_config();
-        let tokens = TokenPair::new("access-value".to_owned(), "refresh-value".to_owned(), 900);
+        let issued = IssuedToken::new("token-value".to_owned(), 604_800);
 
-        let response = session_response(&config, tokens, 604_800, "登录成功").expect("响应应构造成功");
+        let response = session_response(&config, issued, "登录成功").expect("响应应构造成功");
         let bytes = response.into_body().collect().await.expect("响应体应可读取").to_bytes();
         let body = String::from_utf8(bytes.to_vec()).expect("响应体应为 UTF-8");
 
-        assert!(!body.contains("access-value"), "响应体不应包含 access token：{body}");
-        assert!(!body.contains("refresh-value"), "响应体不应包含 refresh token：{body}");
+        assert!(!body.contains("token-value"), "响应体不应包含令牌：{body}");
         assert!(body.contains("\"token_type\":\"cookie\""), "应声明 Cookie 认证：{body}");
+        assert!(body.contains("\"expires_in\":604800"), "应回传令牌剩余有效期：{body}");
     }
 
-    /// 两个 Cookie 的有效期必须各自匹配其令牌。
+    /// Cookie 的 `Max-Age` 必须与令牌有效期一致：
+    /// 否则浏览器会在令牌失效后继续发送它，或提前丢弃仍然有效的令牌。
     #[test]
-    fn cookies_use_matching_max_age() {
+    fn cookie_uses_token_expiry_as_max_age() {
         let config = test_cookie_config();
-        let tokens = TokenPair::new("access-value".to_owned(), "refresh-value".to_owned(), 900);
+        let issued = IssuedToken::new("token-value".to_owned(), 604_800);
 
-        let response = session_response(&config, tokens, 604_800, "登录成功").expect("响应应构造成功");
+        let response = session_response(&config, issued, "登录成功").expect("响应应构造成功");
         let cookies = collect_set_cookies(response.headers());
 
-        let access = cookies.iter().find(|c| c.starts_with("access_token=")).expect("应存在 access Cookie");
-        let refresh = cookies.iter().find(|c| c.starts_with("refresh_token=")).expect("应存在 refresh Cookie");
-
-        assert!(access.contains("Max-Age=900"), "access 有效期应为其自身：{access}");
-        assert!(refresh.contains("Max-Age=604800"), "refresh 有效期应为 7 天：{refresh}");
+        assert!(cookies[0].contains("Max-Age=604800"), "有效期应等于令牌剩余时间：{}", cookies[0]);
     }
 
-    /// 登出必须清除两个 Cookie，避免其中一个残留导致会话未真正结束。
+    /// 登出必须清除令牌 Cookie，且清除属性与下发时一致。
     #[test]
-    fn logout_clears_both_token_cookies() {
+    fn logout_clears_token_cookie() {
         let config = test_cookie_config();
 
         let response = cleared_session_response(&config, "登出成功").expect("响应应构造成功");
         let cookies = collect_set_cookies(response.headers());
 
-        assert_eq!(cookies.len(), 2, "应清除两个 Cookie：{cookies:?}");
-        for cookie in &cookies {
-            assert!(cookie.contains("Max-Age=0"), "清除必须立即生效：{cookie}");
-            assert!(cookie.contains("HttpOnly"), "清除属性需与下发一致：{cookie}");
-        }
+        assert_eq!(cookies.len(), 1, "应只清除一个 Cookie：{cookies:?}");
+        assert!(cookies[0].contains("Max-Age=0"), "清除必须立即生效：{}", cookies[0]);
+        assert!(cookies[0].contains("HttpOnly"), "清除属性需与下发一致：{}", cookies[0]);
     }
 
     /// secure 配置必须真正传递到响应头，否则生产环境会静默地以明文发送令牌。
@@ -315,8 +270,8 @@ mod tests {
         let mut config = test_cookie_config();
         config.secure = true;
 
-        let tokens = TokenPair::new("access-value".to_owned(), "refresh-value".to_owned(), 900);
-        let response = session_response(&config, tokens, 604_800, "登录成功").expect("响应应构造成功");
+        let issued = IssuedToken::new("token-value".to_owned(), 604_800);
+        let response = session_response(&config, issued, "登录成功").expect("响应应构造成功");
 
         for cookie in collect_set_cookies(response.headers()) {
             assert!(cookie.contains("Secure"), "启用 secure 后必须设置：{cookie}");

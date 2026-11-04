@@ -113,7 +113,7 @@ HTTP 状态码仍保持标准语义，不统一强制返回 `200`；客户端应
 
 ## 相关模块
 
-登录、令牌刷新、登出与当前用户接口见 [认证模块 API 文档](./AUTH_API.md)。用户接口需要登录：认证由挂在 `/api/v1` 路由组上的 `common::auth::require_login` 中间件统一强制，Handler 中声明 `common::auth_extractor::CurrentUser` 只用于表达「该接口需要身份」并在需要时读取当前用户。新增接口挂在 `/api/v1` 之下即自动受保护，无需额外声明。
+登录、登出与当前用户接口见 [认证模块 API 文档](./AUTH_API.md)。用户接口需要登录：认证由挂在 `/api/v1` 路由组上的 `common::auth::require_login` 中间件统一强制，Handler 中声明 `common::auth_extractor::CurrentUser` 只用于表达「该接口需要身份」并在需要时读取当前用户。新增接口挂在 `/api/v1` 之下即自动受保护，无需额外声明。
 
 ## 维护方式
 

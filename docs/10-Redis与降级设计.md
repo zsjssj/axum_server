@@ -9,9 +9,9 @@
 ## 10.1 定位：Redis 是加速层，不是权威数据
 
 ```rust
-// src/config/mod.rs:31
+// src/config/mod.rs:32
 /// Redis 在本项目中承担三类「读写频繁、可以重建」的状态：
-/// 登录失败计数、access token 吊销列表、用户资料缓存。
+/// 登录失败计数、登录令牌吊销列表、用户资料缓存。
 /// 它们都有一个共同点：丢失后可以接受
 ```
 
@@ -20,10 +20,10 @@
 | 数据 | 存在 Redis | 丢了会怎样 | 能否接受 |
 | --- | --- | --- | --- |
 | 登录失败计数 | ZSET + TTL | 短时限流失效（还有数据库兜底） | ✅ 可接受 |
-| access token 吊销列表 | STRING + TTL | 已登出的令牌活到自然过期（≤15 分钟） | ✅ 可接受 |
+| 登录令牌吊销列表 | STRING + TTL | 已登出的令牌一直可用到自然过期（最长 7 天） | ✅ 可接受 |
 | 用户资料缓存 | STRING(JSON) + TTL | 多查一次数据库 | ✅ 可接受 |
 | 用户密码哈希 | ❌ 绝不 | 无法重建 | ❌ 只能在 PostgreSQL |
-| refresh token 会话 | ❌ 数据库 | 无法重建、无法吊销 | ❌ 只能在 PostgreSQL |
+| 登录会话审计（`user_sessions`） | ❌ 数据库 | 失去"谁何时登录、何时登出"的追溯记录；认证不依赖它，但审计是安全底线 | ❌ 只能在 PostgreSQL |
 
 由此得到本项目的**依赖分级**：
 
@@ -62,7 +62,7 @@ pub async fn get_json<T>(&self, key: &str) -> Option<T> {
 ### 错误分类：为了排障，不为好看
 
 ```rust
-// src/infrastructure/redis.rs:50
+// src/infrastructure/redis.rs:47
 #[derive(Debug, Error)]
 pub enum RedisStoreError {
     #[error("Redis 配置不合法：{0}")]
@@ -104,9 +104,9 @@ fn normalize_prefix(prefix: &str) -> String {
 
 ```rust
 // src/infrastructure/redis.rs:267
-pub fn login_failure_key(&self, username: &str) -> String  { self.namespaced(&format!("auth:login_failures:{username}")) }
-pub fn revoked_access_key(&self, jti: &str) -> String      { self.namespaced(&format!("auth:revoked_access:{jti}")) }
-pub fn user_detail_key(&self, public_id: Uuid) -> String   { self.namespaced(&format!("user:detail:{public_id}")) }
+pub fn key_login_failure(&self, username: &str) -> String  { self.namespaced(&format!("auth:login_failures:{username}")) }
+pub fn key_revoked_access(&self, jti: &str) -> String      { self.namespaced(&format!("auth:revoked_access:{jti}")) }
+pub fn key_user_detail(&self, public_id: Uuid) -> String   { self.namespaced(&format!("user:detail:{public_id}")) }
 ```
 
 最终形态：`axum:auth:login_failures:alice`、`axum:auth:revoked_access:<jti>`、`axum:user:detail:<uuid>`。
@@ -115,7 +115,7 @@ pub fn user_detail_key(&self, public_id: Uuid) -> String   { self.namespaced(&fo
 
 ```rust
 // src/infrastructure/redis.rs:360
-fn key_categories_do_not_collide() { assert_ne!(store.login_failure_key("x"), store.revoked_access_key("x")); }
+fn key_categories_do_not_collide() { assert_ne!(store.key_login_failure("x"), store.key_revoked_access("x")); }
 ```
 
 ### 连接池：为什么不是"一请求一连接"
@@ -241,17 +241,17 @@ fn window_millis(window: Duration) -> i64 {
 
 ### 谁在用这两个方法
 
-- 判定：`AuthService::count_login_failures`（`src/modules/auth/service.rs:151`）
-- 记录：`AuthService::record_login_failure`（`:173`）
+- 判定：`AuthService::count_login_failures`（`src/modules/auth/service.rs:128`）
+- 记录：`AuthService::record_login_failure`（`:142`）
 
 **失败时的降级**：判定回退数据库统计；记录只告警。详见[第 09 章 9.4](./09-认证与授权.md)。
 
-## 10.4 场景二：access token 吊销列表（STRING + TTL）
+## 10.4 场景二：登录令牌吊销列表（STRING + TTL）
 
 ```rust
 // src/infrastructure/redis.rs:215
 pub async fn revoke_access_token(&self, jti: &str, ttl: Duration) -> Result<(), RedisStoreError> {
-    let key = self.revoked_access_key(jti);
+    let key = self.key_revoked_access(jti);
     let mut connection = self.connection().await?;
 
     connection.set_ex::<_, _, ()>(key, "1", ttl.as_secs().max(1)).await
@@ -262,7 +262,7 @@ pub async fn revoke_access_token(&self, jti: &str, ttl: Duration) -> Result<(), 
 ```rust
 // src/infrastructure/redis.rs:226
 pub async fn is_access_token_revoked(&self, jti: &str) -> Result<bool, RedisStoreError> {
-    let key = self.revoked_access_key(jti);
+    let key = self.key_revoked_access(jti);
     let mut connection = self.connection().await?;
 
     let exists: i64 = connection.exists(&key).await.map_err(RedisStoreError::Command)?;
@@ -357,10 +357,10 @@ fn user_round_trips_through_cache_json() { /* 序列化 → 反序列化 → 逐
 
 | 功能 | Redis 正常 | Redis 故障 | 代码位置 | 安全影响 |
 | --- | --- | --- | --- | --- |
-| 登录失败限流 | Redis ZSET 判定 | **回退数据库统计** | `auth/service.rs:151` | 无（只是慢一点） |
-| 失败计数写入 | Redis + 数据库 | 只写数据库，告警 | `auth/service.rs:173` | 无 |
-| access token 吊销检查 | `EXISTS` 判定 | **按未吊销放行** | `common/auth.rs:104` | 登出的令牌活到自然过期（≤15 分钟） |
-| 登出写吊销 | `SET EX` | 告警，继续清 Cookie | `auth/handler.rs:268` | 同上 |
+| 登录失败限流 | Redis ZSET 判定 | **回退数据库统计** | `auth/service.rs:128` | 无（只是慢一点） |
+| 失败计数写入 | Redis + 数据库 | 只写数据库，告警 | `auth/service.rs:142` | 无 |
+| 登录令牌吊销检查 | `EXISTS` 判定 | **按未吊销放行** | `common/auth.rs:82` | 登出的令牌活到自然过期（最长 7 天） |
+| 登出写吊销 | `SET EX` | 告警，继续清 Cookie | `auth/handler.rs:160` | 同上 |
 | 用户详情缓存读 | 命中直接返回 | 告警，查数据库 | `user/service.rs:79` | 无 |
 | 用户详情缓存回填 | `SET EX` | 告警 | `user/service.rs:91` | 无 |
 | 缓存删除（更新/删除后） | `DEL` | 告警，靠 TTL | `user/service.rs:141` | 陈旧数据最多存活一个 TTL |

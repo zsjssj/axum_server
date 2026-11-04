@@ -28,8 +28,6 @@ use crate::modules::auth::service::AuthService;
 pub const API_PREFIX: &str = "/api/v1";
 /// 登录接口路径，匿名可访问。
 pub const LOGIN_PATH: &str = "/auth/login";
-/// 刷新令牌接口路径，匿名可访问：access token 过期后只能凭刷新 Cookie 换取新令牌。
-pub const REFRESH_PATH: &str = "/auth/refresh";
 /// 登出接口路径，匿名可访问：令牌失效时仍必须能清理会话。
 pub const LOGOUT_PATH: &str = "/auth/logout";
 
@@ -38,13 +36,14 @@ pub const LOGOUT_PATH: &str = "/auth/logout";
 /// 清单刻意保持最小，每一项都有不可移除的理由：
 ///
 /// - [`LOGIN_PATH`]：登录本身必须匿名可访问，否则无法获得凭证。
-/// - [`REFRESH_PATH`]：access token 过期后客户端只剩刷新 Cookie，
-///   若要求先有有效 access token，刷新流程将永远无法启动。
 /// - [`LOGOUT_PATH`]：登出必须幂等，令牌已过期或 Cookie 已丢失时
 ///   仍要能清理服务端会话。要求登录才能登出会让用户陷入无法退出登录的状态。
 ///
+/// 登录令牌是唯一的，没有「刷新」入口：令牌到期后客户端只能重新登录。
+/// 这样白名单少一个匿名接口，也就少一个被滥用的面。
+///
 /// 注册路由时使用上面这些常量拼接，就不会出现「路由改了、白名单没改」的偏差。
-const PUBLIC_PATHS: [&str; 3] = [LOGIN_PATH, REFRESH_PATH, LOGOUT_PATH];
+const PUBLIC_PATHS: [&str; 2] = [LOGIN_PATH, LOGOUT_PATH];
 
 /// 认证通过后写入请求扩展的用户身份。
 ///
@@ -66,22 +65,23 @@ fn is_public_path(path: &str) -> bool {
     PUBLIC_PATHS.contains(&relative_path)
 }
 
-/// 校验请求中的 access token，返回用户身份。
+/// 校验请求中的登录令牌，返回用户身份。
 ///
 /// 令牌只从 Cookie 读取：`Authorization` 头不被解析，避免出现绕过 Cookie
 /// 安全属性（`HttpOnly`、`SameSite`）的旁路认证方式。
 ///
-/// 签名校验通过后还要查询 Redis 吊销列表：登出会把 access token 的 `jti`
-/// 写入该列表，使令牌不必等到自然过期才失效。查询失败时按「未吊销」放行并
-/// 记录告警——吊销是「登出立即生效」的增强，而不是令牌有效性的前提；
-/// Redis 故障时退化为改动前的行为（令牌到期才失效），比把全部已登录用户
-/// 一次性踢下线更合理。
+/// 签名校验通过后还要查询 Redis 吊销列表：登出会把令牌的 `jti`
+/// 写入该列表，使令牌不必等到自然过期才失效——单令牌方案下没有「刷新」
+/// 这条退路，若登出后令牌仍可用，用户唯一的补救办法就是等它过期。
+/// 查询失败时按「未吊销」放行并记录告警——吊销是「登出立即生效」的增强，
+/// 而不是令牌有效性的前提；Redis 故障时退化为「令牌到期才失效」，
+/// 比把全部已登录用户一次性踢下线更合理。
 async fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Result<AuthUser, AppError> {
-    let token = cookie::access_token_from_headers(headers, &state.auth.cookie).ok_or(AppError::Unauthorized("未登录或登录已过期"))?;
+    let token = cookie::token_from_headers(headers, &state.auth.cookie).ok_or(AppError::Unauthorized("未登录或登录已过期"))?;
     let verified = AuthService::verify_access_token(&state.jwt, &token)?;
     match state.redis.is_access_token_revoked(&verified.jti).await {
         Ok(true) => {
-            tracing::debug!(jti = %verified.jti, "access token 已在吊销列表中");
+            tracing::debug!(jti = %verified.jti, "登录令牌已在吊销列表中");
             return Err(AppError::Unauthorized("认证令牌已失效，请重新登录"));
         }
         Ok(false) => {}
@@ -109,11 +109,10 @@ pub async fn require_login(State(state): State<AppState>, request: Request, next
 mod tests {
     use super::*;
 
-    /// 登录、刷新、登出必须匿名可访问，否则客户端无法进入认证流程。
+    /// 登录与登出必须匿名可访问，否则客户端无法进入或退出认证流程。
     #[test]
     fn allows_auth_entrypoints_without_token() {
         assert!(is_public_path("/auth/login"));
-        assert!(is_public_path("/auth/refresh"));
         assert!(is_public_path("/auth/logout"));
     }
 
@@ -121,8 +120,16 @@ mod tests {
     #[test]
     fn also_matches_full_paths_with_api_prefix() {
         assert!(is_public_path("/api/v1/auth/login"));
-        assert!(is_public_path("/api/v1/auth/refresh"));
         assert!(is_public_path("/api/v1/auth/logout"));
+    }
+
+    /// 刷新接口已随双令牌方案一起下线，不能遗留成匿名入口。
+    ///
+    /// 只要它还留在白名单里，将来有人重新注册同名路由时就会默认跳过认证。
+    #[test]
+    fn does_not_whitelist_removed_refresh_route() {
+        assert!(!is_public_path("/auth/refresh"));
+        assert!(!is_public_path("/api/v1/auth/refresh"));
     }
 
     /// 业务接口与示例接口都不在白名单内，必须登录后才能访问。
@@ -172,15 +179,13 @@ mod tests {
                 jwt: Arc::new(JwtConfig {
                     secret: "unit-test-secret-with-enough-length-32".to_owned(),
                     issuer: "rust-axum-server-test".to_owned(),
-                    access_ttl_minutes: 15,
-                    refresh_ttl_days: 7,
+                    ttl_minutes: 10_080,
                 }),
                 auth: Arc::new(AuthConfig {
                     max_login_failures: 5,
                     login_window_minutes: 15,
                     cookie: CookieConfig {
-                        access_name: "access_token".to_owned(),
-                        refresh_name: "refresh_token".to_owned(),
+                        name: "access_token".to_owned(),
                         secure: false,
                         same_site: "strict".to_owned(),
                         path: "/".to_owned(),

@@ -3,7 +3,7 @@ use crate::app::state::AppState;
 use crate::common::error::{ErrorData, ErrorDetail};
 use crate::common::pagination::PaginatedResponse;
 use crate::common::response::{ApiResponse, EmptyData};
-use crate::modules::auth::model::{AuthSessionResponse, CookieNames, CurrentUserResponse, LoginRequest};
+use crate::modules::auth::model::{AuthSessionResponse, CurrentUserResponse, LoginRequest};
 use crate::modules::information::model::{
     AddMembersRequest, ConversationDetail, ConversationMember, ConversationSummary, CreateConversationRequest, Message,
     MessagePage, ReadReceipt, SendMessageRequest,
@@ -27,7 +27,6 @@ use utoipa_swagger_ui::SwaggerUi;
         crate::app::routes::readiness_handler,
         crate::app::routes::hello_handler,
         crate::modules::auth::handler::login,
-        crate::modules::auth::handler::refresh_token,
         crate::modules::auth::handler::logout,
         crate::modules::auth::handler::current_user,
         crate::modules::user::handler::create_user,
@@ -55,7 +54,6 @@ use utoipa_swagger_ui::SwaggerUi;
         UpdateUserRequest,
         LoginRequest,
         AuthSessionResponse,
-        CookieNames,
         CurrentUserResponse,
         PaginatedResponse<User>,
         ApiResponse<User>,
@@ -88,7 +86,7 @@ use utoipa_swagger_ui::SwaggerUi;
     )),
     tags(
         (name = "系统", description = "服务状态与示例接口"),
-        (name = "认证", description = "登录、令牌刷新与登出"),
+        (name = "认证", description = "登录、登出与当前用户"),
         (name = "用户", description = "用户管理接口"),
         (name = "聊天", description = "会话、消息与已读回执")
     )
@@ -118,9 +116,17 @@ mod tests {
         let document = ApiDoc::openapi();
 
         assert!(document.paths.paths.contains_key("/api/v1/auth/login"));
-        assert!(document.paths.paths.contains_key("/api/v1/auth/refresh"));
         assert!(document.paths.paths.contains_key("/api/v1/auth/logout"));
         assert!(document.paths.paths.contains_key("/api/v1/auth/me"));
+    }
+
+    /// 刷新接口已随双令牌方案下线，文档里也不能残留：
+    /// 否则调用方会按文档去调一个必然 `404` 的接口。
+    #[test]
+    fn openapi_does_not_contain_refresh_route() {
+        let document = ApiDoc::openapi();
+
+        assert!(!document.paths.paths.contains_key("/api/v1/auth/refresh"), "单令牌方案不应再暴露刷新接口");
     }
 
     /// 认证改为 Cookie 方案后不应再注册 Bearer 安全方案：

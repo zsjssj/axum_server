@@ -56,7 +56,7 @@ Redis 是一个把数据放在内存里的键值存储（in-memory key-value sto
 | 场景 | 为什么放在 Redis |
 | --- | --- |
 | 登录失败计数 | 每次登录都要读一次，用窗口内的失败次数做限流；计数会随时间自动过期，天然适合 TTL |
-| access token 吊销列表 | JWT 本身无状态，服务端要「登出后立即失效」就必须记一份短期黑名单，Redis 的 `SET ... EX` 正好表达「到令牌过期为止有效」 |
+| 登录令牌吊销列表 | JWT 本身无状态，服务端要「登出后立即失效」就必须记一份黑名单，Redis 的 `SET ... EX` 正好表达「到令牌过期为止有效」 |
 | 用户资料缓存 | 详情接口读多写少，缓存可以显著减少数据库压力；写操作后删缓存，用 TTL 兜底一致性 |
 
 注意这三类数据都有同一特征：**可以重建**。这是允许「Redis 不可用时降级」的前提，也是第 6.4 节降级策略表的基础。
@@ -218,7 +218,7 @@ OK
 2) "2"
 ```
 
-适用场景：计数器（`INCR`）、缓存 JSON、开关、限流标记。本项目的「access token 吊销记录」和「用户缓存」都是 STRING。
+适用场景：计数器（`INCR`）、缓存 JSON、开关、限流标记。本项目的「登录令牌吊销记录」和「用户缓存」都是 STRING。
 
 #### HASH：对象字段
 
@@ -471,7 +471,7 @@ return redis.call('ZCARD', key)
         ↓
 Argon2 校验密码 → 失败：写审计表 + 写 Redis 计数，返回 401
         ↓ 成功
-清理窗口外审计记录 → 签发令牌对
+清理窗口外审计记录 → 签发登录令牌并写入审计会话
 ```
 
 顺序不能颠倒：Argon2 很慢，如果先校验密码，大量失败请求会持续占满阻塞线程池，限流本身反而变成消耗算力的攻击面。
@@ -481,9 +481,9 @@ Argon2 校验密码 → 失败：写审计表 + 写 Redis 计数，返回 401
 - Redis 不可用时，判定回退到数据库统计，限流照常生效；
 - Redis 重启（数据丢失）后，窗口内的历史失败只留在数据库里，Redis 计数从 0 开始。由于攻击者无法主动触发重启，这个窗口期的风险可以接受；若把「重启也不能丢计数」当作硬要求，就应该把计数完全放数据库，或为 Redis 开启 AOF（仍然不是强一致保证）。
 
-### 6.2 场景二：access token 吊销列表（STRING + TTL）
+### 6.2 场景二：登录令牌吊销列表（STRING + TTL）
 
-**要解决的问题**：JWT 无状态，登出后已签发的 access token 在 15 分钟内仍然有效。以前只能在文档里解释「这是双令牌方案的固有性质」；引入 Redis 之后可以做到**登出立即失效**。
+**要解决的问题**：JWT 无状态，登出后已签发的令牌在剩余有效期内仍然有效。本项目只签发一个令牌且没有刷新接口（默认有效期 7 天），若不能立即吊销，用户点「退出登录」后令牌还能用一周——这显然不可接受。Redis 吊销列表让**登出立即失效**成立。
 
 **键设计**：
 
@@ -491,7 +491,7 @@ Argon2 校验密码 → 失败：写审计表 + 写 Redis 计数，返回 401
 axum:auth:revoked_access:<jti>     STRING，值固定为 "1"，TTL = 令牌剩余有效期
 ```
 
-- `jti` 是 JWT 的唯一标识，签发时由 `public_id + 毫秒时间戳` 组合生成，同一用户同一秒多次登录也不会重复；
+- `jti` 是 JWT 的唯一标识，签发时由 `public_id + UUIDv7` 组合生成：前缀便于日志定位用户，随机部分保证同一毫秒内多次登录也不会重复（会话表以令牌摘要为唯一键，重复会直接撞唯一约束）；
 - **TTL 用「剩余有效期」而不是固定值**：令牌自然过期后，吊销记录不再有任何作用，让它和令牌一起消失，键不会无限累积；
 - 写入用 `SET key "1" EX <秒>` 单条命令，避免 `SET` 成功、`EXPIRE` 失败的中间状态。
 
@@ -569,7 +569,7 @@ Redis 在本项目是「可选加速组件」，每个使用点都定义了降�
 | --- | --- | --- | --- |
 | 登录失败计数 | Redis 滑动窗口 | 回退 `login_failures` 表统计 | 限流仍有效，只是每次多一条 SQL |
 | 失败记录写入 | 审计表 + Redis 计数 | 审计表 + 告警 | 限流回退数据库，行为不变 |
-| 登出吊销 access token | 写吊销列表，立即失效 | 告警并跳过 | 令牌自然过期前仍有效（与改动前一致） |
+| 登出吊销令牌 | 写吊销列表，立即失效 | 告警并跳过 | 令牌在剩余有效期内仍可用（最长 7 天，应保证 Redis 可用） |
 | 认证时吊销检查 | `EXISTS` 查询 | 告警并按未吊销放行 | 同上 |
 | 用户详情查询 | 缓存优先 | 直接查库 | 延迟上升，功能正常 |
 | 更新/删除失效 | `DEL` 缓存 | 告警 | 陈旧数据最多存在一个 TTL |
@@ -671,19 +671,19 @@ redis-cli EXISTS "axum:user:detail:$USER_ID"   # 期望 0
 
 再请求一次详情，缓存会被重新写入；此时如果直接用 `redis-cli DEL` 删掉缓存，第二次请求仍会成功（回源数据库），这就是第 6.3 节的「缓存只是加速层」。
 
-### 实验 4：登出后 access token 立即失效
+### 实验 4：登出后登录令牌立即失效
 
 ```bash
-# 1. 登出（cookies.txt 中带有 access_token 与 refresh_token）
+# 1. 登出（cookies.txt 中只带一个令牌 Cookie）
 curl -s -b cookies.txt -X POST http://127.0.0.1:3000/api/v1/auth/logout; echo
 
 # 2. 查看吊销记录（jti 很长，用 scan 找）
 redis-cli --scan --pattern 'axum:auth:revoked_access:*'
 
-# 3. 关键验证：继续用旧的 access_token 访问受保护接口
+# 3. 关键验证：继续用旧的令牌访问受保护接口
 #    步骤 1 只用了 -b，没有把响应里的清除 Cookie 写回文件，
 #    所以 cookies.txt 里仍是登出前的令牌；这里为了清晰手工传入：
-curl -s -H "Cookie: access_token=<登出前的 access_token>" \
+curl -s -H "Cookie: access_token=<登出前的令牌>" \
   http://127.0.0.1:3000/api/v1/auth/me
 # 期望 401，message 为「认证令牌已失效，请重新登录」
 ```
@@ -822,7 +822,7 @@ docker start axum-redis
 | --- | --- |
 | 连接池、键命名、限流/吊销/缓存原语、Lua 脚本 | `src/infrastructure/redis.rs` |
 | 登录限流与失败记录 | `src/modules/auth/service.rs`（`login`、`count_login_failures`、`record_login_failure`） |
-| 登出吊销 access token | `src/modules/auth/service.rs`（`revoke_access_token`）、`src/modules/auth/handler.rs`（`logout`） |
+| 登出吊销登录令牌 | `src/modules/auth/service.rs`（`revoke_access_token`、`logout`）、`src/modules/auth/handler.rs`（`logout`） |
 | 认证时查询吊销列表 | `src/common/auth.rs`（`authenticate`） |
 | 用户详情缓存与失效 | `src/modules/user/service.rs`（`get_user_by_public_id`、`evict_user_cache`） |
 | 状态装配 | `src/app/state.rs`、`src/app/mod.rs`、`src/main.rs` |

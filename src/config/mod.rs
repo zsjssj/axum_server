@@ -22,6 +22,7 @@ pub struct ServerConfig {
 pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: u32,
+    pub connection_timeout_seconds: u64,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
@@ -31,7 +32,7 @@ pub struct LogConfig {
 /// Redis 配置。
 ///
 /// Redis 在本项目中承担三类「读写频繁、可以重建」的状态：
-/// 登录失败计数、access token 吊销列表、用户资料缓存。
+/// 登录失败计数、登录令牌吊销列表、用户资料缓存。
 /// 它们都有一个共同点：丢失后可以接受，因此 Redis 停机时各项功能会降级
 ///（详见 `docs/reference/REDIS_GUIDE.md`），而数据库中的权威数据不受影响。
 #[derive(Debug, Clone, Deserialize)]
@@ -51,7 +52,9 @@ pub struct RedisConfig {
     ///
     /// TTL 是缓存一致性的最后一道兜底：即使某次更新漏了主动失效，
     /// 陈旧数据最多存在这么久。
-    pub user_cache_ttl_seconds: i64,
+    pub user_cache_ttl_seconds: u64,
+    /// 连接超时时间
+    pub connection_timeout_seconds: u64,
 }
 
 /// JWT 签发与校验配置。
@@ -62,10 +65,12 @@ pub struct RedisConfig {
 pub struct JwtConfig {
     pub secret: String,
     pub issuer: String,
-    /// access token 有效期（分钟）。取值较短，因为无状态令牌无法单独吊销。
-    pub access_ttl_minutes: i64,
-    /// refresh token 有效期（天）。
-    pub refresh_ttl_days: i64,
+    /// 唯一登录令牌的有效期（分钟）。
+    ///
+    /// 本项目只签发一个令牌，不提供刷新机制：到期后服务端一律返回 `401`，
+    /// 由客户端引导用户重新登录。因此该取值直接决定「一次登录能用多久」，
+    /// 需要在安全性与登录频次之间取舍，而不是像双令牌方案那样取一个很短的值。
+    pub ttl_minutes: i64,
 }
 
 /// 登录保护配置。
@@ -85,10 +90,10 @@ pub struct AuthConfig {
 /// 从而把 XSS 的影响限制在"攻击者可以代为发请求"，而无法直接窃取令牌长期冒用。
 #[derive(Debug, Clone, Deserialize)]
 pub struct CookieConfig {
-    /// access token 的 Cookie 名称。
-    pub access_name: String,
-    /// refresh token 的 Cookie 名称。
-    pub refresh_name: String,
+    /// 令牌 Cookie 的名称。
+    ///
+    /// 单令牌方案下只需要一个名字，不再区分 access 与 refresh。
+    pub name: String,
     /// 是否仅通过 HTTPS 传输。
     ///
     /// 生产环境必须为 `true`，否则令牌会在明文 HTTP 中被中间人截获。
@@ -141,6 +146,13 @@ pub struct BootstrapConfig {
 /// HS256 的安全性完全依赖密钥熵，低于该长度的密钥存在被离线爆破的风险。
 const MIN_JWT_SECRET_LENGTH: usize = 32;
 
+/// 登录令牌有效期的上限（分钟），一年。
+///
+/// 单令牌方案下令牌有效期直接等于「一次登录能用多久」，超过一年已经失去
+/// 意义；更要紧的是 `chrono::Duration::minutes` 对超大取值会溢出，配置里
+/// 多打几个 0 就会让登录在运行期 panic，因此在这里提前拒绝。
+const MAX_TOKEN_TTL_MINUTES: i64 = 365 * 24 * 60;
+
 impl AppConfig {
     pub fn new() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok(); // 加载 .env 文件（如果存在）
@@ -170,18 +182,25 @@ impl AppConfig {
         if self.jwt.secret.len() < MIN_JWT_SECRET_LENGTH {
             return Err(ConfigError::Message(format!("JWT 密钥长度不得少于 {MIN_JWT_SECRET_LENGTH} 个字符")));
         }
-        if self.jwt.access_ttl_minutes <= 0 || self.jwt.refresh_ttl_days <= 0 {
+        if self.jwt.ttl_minutes <= 0 {
             return Err(ConfigError::Message("JWT 有效期必须为正数".to_owned()));
+        }
+        if self.jwt.ttl_minutes > MAX_TOKEN_TTL_MINUTES {
+            return Err(ConfigError::Message(format!(
+                "jwt.ttl_minutes 不能超过 {MAX_TOKEN_TTL_MINUTES} 分钟（一年）"
+            )));
         }
         if self.auth.max_login_failures <= 0 || self.auth.login_window_minutes <= 0 {
             return Err(ConfigError::Message("登录保护的失败次数与统计窗口必须为正数".to_owned()));
         }
-        if self.auth.cookie.access_name.trim().is_empty() || self.auth.cookie.refresh_name.trim().is_empty() {
+        if self.auth.cookie.name.trim().is_empty() {
             return Err(ConfigError::Message("Cookie 名称不能为空".to_owned()));
         }
-        if self.auth.cookie.access_name == self.auth.cookie.refresh_name {
-            return Err(ConfigError::Message("access token 与 refresh token 的 Cookie 名称不能相同".to_owned()));
+
+        if self.database.connection_timeout_seconds == 0 || self.database.connection_timeout_seconds > 10 {
+            return Err(ConfigError::Message("database.connection_timeout_seconds 必须大于 0  且不超过 10s".to_owned()));
         }
+
         // Redis 是可选加速组件，但一旦配置了就应当是可用配置：
         // 地址写成拼写错误时，运行期所有 Redis 功能都会静默降级为「未启用」，
         // 排障时极难联想到是配置写错。这里在启动阶段直接拒绝明显非法的取值。
@@ -191,12 +210,15 @@ impl AppConfig {
         if self.redis.pool_size == 0 {
             return Err(ConfigError::Message("redis.pool_size 必须大于 0".to_owned()));
         }
+        if self.redis.connection_timeout_seconds == 0 || self.redis.connection_timeout_seconds > 5 {
+            return Err(ConfigError::Message("redis.connection_timeout_seconds 必须大于 0  且小于 10".to_owned()));
+        }
         if self.redis.key_prefix.trim().is_empty() {
             return Err(ConfigError::Message(
                 "redis.key_prefix 不能为空：缺少命名空间会让不同环境的键互相覆盖".to_owned(),
             ));
         }
-        if self.redis.user_cache_ttl_seconds <= 0 {
+        if self.redis.user_cache_ttl_seconds == 0 {
             return Err(ConfigError::Message("redis.user_cache_ttl_seconds 必须为正数".to_owned()));
         }
         // 启用引导账号却缺少必要字段，会在服务已经启动之后才暴露为「无人能登录」。
@@ -232,6 +254,7 @@ mod tests {
             database: DatabaseConfig {
                 url: "postgresql://localhost:5432/postgres".to_owned(),
                 max_connections: 5,
+                connection_timeout_seconds: 3,
             },
             log: LogConfig { level: "info".to_owned() },
             redis: RedisConfig {
@@ -239,19 +262,19 @@ mod tests {
                 pool_size: 8,
                 key_prefix: "axum-test".to_owned(),
                 user_cache_ttl_seconds: 60,
+                connection_timeout_seconds: 5,
             },
             jwt: JwtConfig {
                 secret: "a".repeat(MIN_JWT_SECRET_LENGTH),
                 issuer: "rust-axum-server".to_owned(),
-                access_ttl_minutes: 15,
-                refresh_ttl_days: 7,
+                // 7 天：单令牌方案下的默认登录有效期。
+                ttl_minutes: 10_080,
             },
             auth: AuthConfig {
                 max_login_failures: 5,
                 login_window_minutes: 15,
                 cookie: CookieConfig {
-                    access_name: "access_token".to_owned(),
-                    refresh_name: "refresh_token".to_owned(),
+                    name: "access_token".to_owned(),
                     secure: false,
                     same_site: "strict".to_owned(),
                     path: "/".to_owned(),
@@ -284,9 +307,20 @@ mod tests {
     #[test]
     fn rejects_non_positive_ttl() {
         let mut config = valid_config();
-        config.jwt.access_ttl_minutes = 0;
+        config.jwt.ttl_minutes = 0;
 
         assert!(config.validate().is_err(), "非正数有效期应被拒绝");
+    }
+
+    /// 超大 TTL 会在 `chrono::Duration::minutes` 处溢出，
+    /// 必须在启动阶段拒绝，而不是等第一次登录 panic。
+    #[test]
+    fn rejects_absurd_ttl() {
+        let mut config = valid_config();
+        config.jwt.ttl_minutes = MAX_TOKEN_TTL_MINUTES + 1;
+
+        let error = config.validate().expect_err("超过一年的有效期应被拒绝");
+        assert!(error.to_string().contains("jwt.ttl_minutes"));
     }
 
     #[test]
@@ -298,17 +332,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_identical_cookie_names() {
-        let mut config = valid_config();
-        config.auth.cookie.refresh_name = config.auth.cookie.access_name.clone();
-
-        assert!(config.validate().is_err(), "两个令牌共用同一 Cookie 名称会互相覆盖，必须被拒绝");
-    }
-
-    #[test]
     fn rejects_blank_cookie_name() {
         let mut config = valid_config();
-        config.auth.cookie.access_name = "  ".to_owned();
+        config.auth.cookie.name = "  ".to_owned();
 
         assert!(config.validate().is_err(), "空 Cookie 名称应被拒绝");
     }

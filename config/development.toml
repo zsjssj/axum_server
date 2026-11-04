@@ -11,6 +11,7 @@ url = "redis://127.0.0.1:6379"
 pool_size = 8 
 key_prefix = "axum" 
 user_cache_ttl_seconds = 60 
+connection_timeout_seconds = 5
 
 [log]
 level = "debug"
@@ -18,16 +19,14 @@ level = "debug"
 [jwt]
 secret = "dev-only-insecure-secret-change-me-32chars"
 issuer = "rust-axum-server"
-access_ttl_minutes = 15
-refresh_ttl_days = 7
+ttl_minutes = 10080
 
 [auth]
 max_login_failures = 5
 login_window_minutes = 15
 
 [auth.cookie]
-access_name = "access_token"
-refresh_name = "refresh_token"
+name = "access_token"
 secure = false
 same_site = "strict"
 path = "/"

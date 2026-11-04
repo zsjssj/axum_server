@@ -1,9 +1,7 @@
-use std::sync::Arc;
-
-use sqlx::PgPool;
-
 use crate::config::{AuthConfig, JwtConfig};
 use crate::infrastructure::redis::RedisStore;
+use sqlx::PgPool;
+use std::sync::Arc;
 
 /// 应用全局状态
 ///
@@ -12,7 +10,7 @@ use crate::infrastructure::redis::RedisStore;
 /// `Arc` 保证克隆状态时不会复制配置内容。
 ///
 /// [`RedisStore`] 内部是共享连接池与不可变配置，克隆成本与 `Arc` 相同；
-/// 它承担登录失败计数、access token 吊销与用户资料缓存三类状态，
+/// 它承担登录失败计数、登录令牌吊销与用户资料缓存三类状态，
 /// 但不保存任何无法从数据库重建的权威数据。
 #[derive(Clone)]
 pub struct AppState {

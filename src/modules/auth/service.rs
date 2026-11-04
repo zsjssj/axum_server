@@ -9,17 +9,16 @@ use uuid::Uuid;
 use crate::common::error::AppError;
 use crate::config::{AuthConfig, JwtConfig};
 use crate::infrastructure::redis::RedisStore;
-use crate::modules::auth::model::{CurrentUserResponse, TokenPair};
+use crate::modules::auth::model::{CurrentUserResponse, IssuedToken};
 use crate::modules::auth::repository::AuthRepository;
 use crate::modules::user::repository::UserRepository;
 
-/// access token 的令牌类型标识。
-const TOKEN_TYPE_ACCESS: &str = "access";
-/// 刷新令牌的随机字节数。
+/// 令牌类型标识。
 ///
-/// 256 位随机量使刷新令牌无法被枚举或猜测，这是它唯一的防伪手段——
-/// 与 access token 不同，刷新令牌不携带签名。
-const REFRESH_TOKEN_BYTES: usize = 32;
+/// 本项目只签发一种登录令牌，该声明因此不参与「区分两种令牌」的判断；
+/// 保留它是为了给将来的其他用途令牌（例如一次性链接、服务间令牌）留出
+/// 拒绝余地：只要 `typ` 不等于本值，就一律不当作登录令牌使用。
+const TOKEN_TYPE_ACCESS: &str = "access";
 
 /// 认证业务逻辑层。
 ///
@@ -27,7 +26,7 @@ const REFRESH_TOKEN_BYTES: usize = 32;
 /// 也避免在业务代码中散落配置访问。
 pub struct AuthService;
 
-/// 校验通过的 access token 中与授权、吊销有关的信息。
+/// 校验通过的登录令牌中与授权、吊销有关的信息。
 ///
 /// 中间件除了用户身份之外还需要 `jti`（吊销列表的键），因此不再只返回用户主键。
 #[derive(Debug, Clone)]
@@ -38,7 +37,7 @@ pub struct VerifiedAccessToken {
     pub jti: String,
 }
 
-/// access token 负载。
+/// 登录令牌负载。
 ///
 /// 字段名使用 JWT 注册声明的短名（`sub`/`iss`/`exp`/`iat`/`jti`），
 /// 其余为私有声明。
@@ -50,12 +49,13 @@ struct AccessClaims {
     iss: String,
     exp: i64,
     iat: i64,
-    /// 令牌唯一标识，便于把日志与单次签发对应起来。
+    /// 令牌唯一标识，便于把日志与单次签发对应起来，也是吊销列表的键。
     jti: String,
     /// 令牌类型。
     ///
-    /// 该字段是必需的安全约束：缺少它时，长效刷新令牌可以被直接当作
-    /// access token 使用，从而绕过"access token 短期有效"的整个设计。
+    /// 校验时必须断言其等于 `access`：今天只有一个令牌种类，这项检查看似多余，
+    /// 但它把「令牌用途」写进了契约。将来引入其他用途的令牌时，忘记加断言
+    /// 的后果是被越权使用，而这里的失败方向是拒绝。
     typ: String,
 }
 
@@ -71,7 +71,7 @@ pub struct LoginContext<'a> {
 }
 
 impl AuthService {
-    /// 用户登录：核验凭证并签发令牌对。
+    /// 用户登录：核验凭证并签发唯一的登录令牌。
     ///
     /// `context` 中的客户端信息仅用于安全审计记录，不参与认证判定。
     pub async fn login(
@@ -82,7 +82,7 @@ impl AuthService {
         username: &str,
         password: &str,
         context: LoginContext<'_>,
-    ) -> Result<TokenPair, AppError> {
+    ) -> Result<IssuedToken, AppError> {
         let now = Utc::now();
         let window = rate_limit_window(auth_config);
         let window_start = now - ChronoDuration::minutes(auth_config.login_window_minutes);
@@ -117,7 +117,7 @@ impl AuthService {
         // 「只要偶尔成功一次就能重置限额」的入口。窗口外的成员会在下次读取时
         // 被脚本修剪，键本身也带 TTL，不需要额外维护。
         AuthRepository::clear_failures_before(db, username, window_start).await?;
-        Self::issue_token_pair(db, jwt_config, credentials.id, credentials.public_id, context.client_ip, context.user_agent).await
+        Self::issue_token(db, jwt_config, credentials.id, credentials.public_id, context.client_ip, context.user_agent).await
     }
 
     /// 统计窗口内的登录失败次数。
@@ -151,47 +151,21 @@ impl AuthService {
         Ok(())
     }
 
-    /// 使用刷新令牌换取新的令牌对。
+    /// 登出：把令牌对应的会话审计记录标记为已吊销。
     ///
-    /// 采用轮换策略：每次刷新都签发全新的刷新令牌并吊销旧的。
-    pub async fn refresh(
-        db: &PgPool,
-        jwt_config: &JwtConfig,
-        refresh_token: &str,
-        client_ip: Option<&str>,
-        user_agent: Option<&str>,
-    ) -> Result<TokenPair, AppError> {
-        let token_hash = hash_token(refresh_token);
-        let session = AuthRepository::find_session_with_user(db, &token_hash)
-            .await?
-            .ok_or_else(|| AppError::Unauthorized("刷新令牌无效"))?;
-        // 已吊销的刷新令牌再次被使用，说明令牌可能已泄露并被重放：
-        // 合法客户端在轮换后不会再用旧令牌。此时无法分辨谁是攻击者，
-        // 只能吊销该用户全部会话，让双方都重新登录。
-        if session.is_revoked {
-            tracing::warn!(user_id = session.user_id, "检测到已吊销的刷新令牌被再次使用，强制该用户全部会话下线");
-            AuthRepository::revoke_all_sessions_for_user(db, session.user_id).await?;
-            return Err(AppError::Unauthorized("刷新令牌已失效，请重新登录"));
-        }
-        if session.expires_at <= Utc::now() {
-            return Err(AppError::Unauthorized("刷新令牌已过期，请重新登录"));
-        }
-        let token_pair = Self::issue_token_pair(db, jwt_config, session.user_id, session.public_id, client_ip, user_agent).await?;
-        // 新会话已经落库，再把旧会话标记为已吊销并记录轮换关系。
-        let new_session_id = AuthRepository::find_session_with_user(db, &hash_token(&token_pair.refresh_token))
-            .await?
-            .ok_or(AppError::Internal("令牌会话写入后无法读取"))?
-            .id;
-        AuthRepository::rotate_session(db, session.id, new_session_id).await?;
-        Ok(token_pair)
-    }
-
-    /// 登出：吊销刷新令牌对应的会话。
+    /// 单令牌方案下没有需要吊销的「续期凭据」，这条记录只承担审计作用：
+    /// 它回答「这次登出发生在什么时候、来自哪个客户端」，但不参与每次请求的
+    /// 认证判定。真正让令牌立刻失效的是 [`Self::revoke_access_token`]。
+    /// 记录被标记吊销而令牌在 Redis 吊销列表写入成功前仍可通过校验，
+    /// 是两条独立职责的必然分工，不是遗漏。
     ///
-    /// 操作设计为幂等——已吊销或已过期的令牌同样返回成功。
+    /// 操作设计为幂等——已吊销、已过期或从未签发的令牌同样返回成功。
     /// 客户端在网络抖动后重试登出不应收到 401，否则会陷入无法退出的状态。
-    pub async fn logout(db: &PgPool, refresh_token: &str) -> Result<(), AppError> {
-        let token_hash = hash_token(refresh_token);
+    ///
+    /// 查找只用摘要、不解析令牌：这样令牌即使已经过期也能正确定位到记录，
+    /// 否则「过期后登出」会退化成匿名请求，留下一段永远不会关闭的会话。
+    pub async fn logout(db: &PgPool, token: &str) -> Result<(), AppError> {
+        let token_hash = hash_token(token);
         let Some(session) = AuthRepository::find_session_by_token_hash(db, &token_hash).await? else {
             // 令牌无法对应任何会话，说明它从未被签发或已被清理。
             // 从调用方视角登出目标已达成，因此同样返回成功而不是报错。
@@ -201,12 +175,12 @@ impl AuthService {
         Ok(())
     }
 
-    /// 把 access token 写入吊销列表，使它在自然过期前立即失效。
+    /// 把令牌写入吊销列表，使它在自然过期前立即失效。
     ///
-    /// 换入 Redis 之后，「登出立即失效 access token」才真正成立：
-    /// 在此之前只能等令牌自然过期（`access_ttl_minutes`），因为服务端不保存
-    /// 任何 access token 状态。吊销记录只需要「令牌唯一标识 + 剩余有效期」，
-    /// 用一条带 TTL 的字符串即可表达，令牌过期后记录也会自动消失。
+    /// 单令牌方案下这是唯一能「让登出立即生效」的手段：在此之前只能等令牌
+    /// 自然过期（`ttl_minutes`，默认 7 天），因为服务端不保存令牌状态。
+    /// 吊销记录只需要「令牌唯一标识 + 剩余有效期」，用一条带 TTL 的字符串
+    /// 即可表达，令牌过期后记录也会自动消失。
     ///
     /// 无法解析或已过期的令牌直接返回成功：这类令牌本来就通不过认证中间件，
     /// 写入一条永远不会被查询的记录没有意义。
@@ -222,19 +196,19 @@ impl AuthService {
             .revoke_access_token(&claims.jti, Duration::from_secs(remaining as u64))
             .await
             .map_err(|error| {
-                tracing::warn!(%error, "写入 access token 吊销列表失败");
+                tracing::warn!(%error, "写入令牌吊销列表失败");
                 AppError::Internal("令牌吊销失败")
             })
     }
 
-    /// 解析 access token，返回用户身份、吊销标识与到期时间。
+    /// 解析登录令牌，返回用户身份与吊销标识。
     pub fn verify_access_token(jwt_config: &JwtConfig, token: &str) -> Result<VerifiedAccessToken, AppError> {
         let claims = decode_access_claims(jwt_config, token)?;
         let user_id = claims.sub.parse::<i64>().map_err(|_| AppError::Unauthorized("认证令牌无效"))?;
         Ok(VerifiedAccessToken { user_id, jti: claims.jti })
     }
 
-    /// 签发一个 access token，仅供测试构造已登录请求使用。
+    /// 签发一个登录令牌，仅供测试构造已登录请求使用。
     ///
     /// 存在的原因：认证中间件挂在 `/api/v1` 整组路由上，任何端到端测试都必须
     /// 先构造合法令牌。测试若自行拼装 JWT，就会与生产签发逻辑分叉——真实实现
@@ -260,7 +234,7 @@ impl AuthService {
             typ: TOKEN_TYPE_ACCESS.to_owned(),
         };
 
-        encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(jwt_config.secret.as_bytes())).expect("测试用 access token 应签发成功")
+        encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(jwt_config.secret.as_bytes())).expect("测试用登录令牌应签发成功")
     }
 
     /// 加载当前登录用户的公开资料。
@@ -277,31 +251,30 @@ impl AuthService {
         })
     }
 
-    /// 生成令牌对并将会话写入数据库。
-    async fn issue_token_pair(
+    /// 生成登录令牌并写入一条会话审计记录。
+    ///
+    /// 令牌与记录必须一次签发：如果先落库再签发，签发失败会留下一条指向不存在
+    /// 令牌的记录；如果先签发再落库，落库失败却返回了令牌，审计与凭据就会脱节。
+    /// 因此顺序固定为「签发 → 写摘要 → 返回」，任一步失败都整体返回错误。
+    async fn issue_token(
         db: &PgPool,
         jwt_config: &JwtConfig,
         user_id: i64,
         public_id: Uuid,
         client_ip: Option<&str>,
         user_agent: Option<&str>,
-    ) -> Result<TokenPair, AppError> {
+    ) -> Result<IssuedToken, AppError> {
         let now = Utc::now();
-        let access_expires_in = ChronoDuration::minutes(jwt_config.access_ttl_minutes);
-        let refresh_expires_at = now + ChronoDuration::days(jwt_config.refresh_ttl_days);
+        let ttl = ChronoDuration::minutes(jwt_config.ttl_minutes);
 
-        let access_token = encode_access_token(jwt_config, user_id, public_id, now)?;
-
-        // 刷新令牌使用独立的高熵随机值而不是 JWT：它只需要"不可猜测"，
-        // 不需要被解析，把状态完全放在数据库里反而更容易做到即时吊销。
-        let refresh_token = generate_refresh_token();
-        let refresh_token_hash = hash_token(&refresh_token);
+        let token = encode_access_token(jwt_config, user_id, public_id, now)?;
 
         // 只把摘要写入数据库：即使数据库泄露，攻击者也无法用摘要反推出
-        // 可用于认证的原始刷新令牌。
-        AuthRepository::create_session(db, user_id, &refresh_token_hash, refresh_expires_at, client_ip, user_agent).await?;
+        // 可用于认证的原始令牌。这条记录仅用于审计，不参与每次请求的认证判定。
+        let token_hash = hash_token(&token);
+        AuthRepository::create_session(db, user_id, &token_hash, now + ttl, client_ip, user_agent).await?;
 
-        Ok(TokenPair::new(access_token, refresh_token, access_expires_in.num_seconds()))
+        Ok(IssuedToken::new(token, ttl.num_seconds()))
     }
 }
 
@@ -321,25 +294,28 @@ fn rate_limit_window(auth_config: &AuthConfig) -> Duration {
     Duration::from_secs((auth_config.login_window_minutes * 60).max(60) as u64)
 }
 
-/// 签发 access token。
+/// 签发登录令牌。
 fn encode_access_token(jwt_config: &JwtConfig, user_id: i64, public_id: Uuid, now: DateTime<Utc>) -> Result<String, AppError> {
-    // jti 使用 public_id 与签发时间组合，保证同一用户在同一秒内多次登录
-    // 也能得到不同取值，便于日志区分单次签发。
+    // jti 由 public_id 前缀加 UUIDv7 组成：前缀让日志能直接看出是哪个用户的签发，
+    // UUIDv7 的随机性保证「同一毫秒内多次登录」也不会撞上同一个标识。
+    //
+    // 这里不能退化成毫秒时间戳：会话表以令牌摘要做唯一约束，而同一用户在同一
+    // 毫秒内签发两次会得到完全相同的令牌，插入时直接撞唯一键并把登录变成 500。
     let claims = AccessClaims {
         sub: user_id.to_string(),
         iss: jwt_config.issuer.clone(),
-        exp: (now + ChronoDuration::minutes(jwt_config.access_ttl_minutes)).timestamp(),
+        exp: (now + ChronoDuration::minutes(jwt_config.ttl_minutes)).timestamp(),
         iat: now.timestamp(),
-        jti: format!("{public_id}:{}", now.timestamp_millis()),
+        jti: format!("{public_id}:{}", Uuid::now_v7()),
         typ: TOKEN_TYPE_ACCESS.to_owned(),
     };
     encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(jwt_config.secret.as_bytes())).map_err(|error| {
-        tracing::error!(%error, "access token 签发失败");
+        tracing::error!(%error, "登录令牌签发失败");
         AppError::Internal("令牌签发失败")
     })
 }
 
-/// 校验并解析 access token。
+/// 校验并解析登录令牌。
 fn decode_access_claims(jwt_config: &JwtConfig, token: &str) -> Result<AccessClaims, AppError> {
     // 显式指定 HS256，绝不从令牌头部读取算法。若信任头部声明的 alg，
     // 攻击者可将算法改为 none 或把非对称公钥当作 HMAC 密钥，从而伪造任意令牌。
@@ -351,35 +327,28 @@ fn decode_access_claims(jwt_config: &JwtConfig, token: &str) -> Result<AccessCla
     validation.leeway = 5;
     let token_data =
         decode::<AccessClaims>(token, &DecodingKey::from_secret(jwt_config.secret.as_bytes()), &validation).map_err(|error| match error.kind() {
-            jsonwebtoken::errors::ErrorKind::ExpiredSignature => AppError::Unauthorized("认证令牌已过期"),
+            // 单令牌方案下「过期」不是可以自动续期的中间状态，客户端唯一的后续
+            // 动作就是重新登录，因此文案只陈述事实，不暗示存在刷新接口。
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => AppError::Unauthorized("认证令牌已过期，请重新登录"),
             other => {
-                tracing::debug!(?other, "access token 校验失败");
+                tracing::debug!(?other, "登录令牌校验失败");
                 AppError::Unauthorized("认证令牌无效")
             }
         })?;
-    // 断言类型，阻止长效刷新令牌被当作 access token 使用。
+    // 断言类型：今天的令牌种类只有一种，但把「用途」写进契约后，
+    // 将来新增其他用途的令牌时不会因为漏判而被当作登录凭据使用。
     if token_data.claims.typ != TOKEN_TYPE_ACCESS {
         return Err(AppError::Unauthorized("认证令牌类型错误"));
     }
     Ok(token_data.claims)
 }
 
-/// 生成高熵刷新令牌。
+/// 计算令牌摘要。
 ///
-/// rand 0.10 起 `thread_rng()` 更名为 `rng()`，`fill_bytes` 由 `Rng` trait 提供
-/// （`RngCore` 不再从 crate 根重导出）。
-fn generate_refresh_token() -> String {
-    use rand::Rng;
-    let mut bytes = [0u8; REFRESH_TOKEN_BYTES];
-    rand::rng().fill_bytes(&mut bytes);
-    to_hex(&bytes)
-}
-
-/// 计算刷新令牌摘要。
-///
-/// 使用 SHA-256 而不是 Argon2：刷新令牌本身已是 256 位随机值，不存在
-/// 字典攻击空间；摘要的作用是防止数据库泄露后令牌被直接复用，
-/// 而 Argon2 的慢速特性会在每次刷新时带来不必要的延迟。
+/// 使用 SHA-256 而不是 Argon2：令牌本身是服务端签发的 JWT，不需要抵抗字典
+/// 攻击（伪造者没有签名密钥就无法构造出可接受的令牌）；摘要的作用只是让
+/// 数据库泄露时无法直接拿到可用令牌，而 Argon2 的慢速特性会在每次登录时
+/// 带来不必要的延迟。
 fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     to_hex(&digest)
@@ -440,8 +409,8 @@ mod tests {
         JwtConfig {
             secret: "unit-test-secret-with-enough-length-32".to_owned(),
             issuer: "rust-axum-server-test".to_owned(),
-            access_ttl_minutes: 15,
-            refresh_ttl_days: 7,
+            // 7 天，与默认配置保持一致。
+            ttl_minutes: 10_080,
         }
     }
 
@@ -449,7 +418,7 @@ mod tests {
     fn encodes_and_decodes_access_token() {
         let config = test_jwt_config();
         let now = Utc::now();
-        let token = encode_access_token(&config, 42, Uuid::now_v7(), now).expect("access token 应签发成功");
+        let token = encode_access_token(&config, 42, Uuid::now_v7(), now).expect("登录令牌应签发成功");
 
         let verified = AuthService::verify_access_token(&config, &token).expect("刚签发的令牌应通过校验");
 
@@ -457,10 +426,44 @@ mod tests {
         assert!(!verified.jti.is_empty(), "jti 用作吊销键，不能为空");
     }
 
+    /// 令牌有效期必须严格取自配置：单令牌方案下它就是「一次登录能用多久」，
+    /// 写死一个值会让改配置变成无效操作。
+    #[test]
+    fn token_expiry_follows_configured_ttl() {
+        let mut config = test_jwt_config();
+        config.ttl_minutes = 60;
+        let now = Utc::now();
+        let token = encode_access_token(&config, 1, Uuid::now_v7(), now).expect("登录令牌应签发成功");
+
+        let claims = decode_access_claims(&config, &token).expect("刚签发的令牌应通过校验");
+
+        assert_eq!(claims.exp - claims.iat, 60 * 60, "exp 与 iat 之差应等于配置的有效期");
+    }
+
+    /// 同一用户在同一毫秒内登录两次必须得到不同的令牌。
+    ///
+    /// 会话表以令牌摘要作为唯一键：若标识退化成毫秒时间戳，两次签发会得到
+    /// 完全相同的令牌，第二次登录直接撞唯一约束并把 500 抛给用户。
+    #[test]
+    fn jti_is_unique_for_logins_in_the_same_millisecond() {
+        let config = test_jwt_config();
+        let now = Utc::now();
+        let public_id = Uuid::now_v7();
+
+        let first = encode_access_token(&config, 7, public_id, now).expect("登录令牌应签发成功");
+        let second = encode_access_token(&config, 7, public_id, now).expect("登录令牌应签发成功");
+
+        let first_claims = decode_access_claims(&config, &first).expect("刚签发的令牌应通过校验");
+        let second_claims = decode_access_claims(&config, &second).expect("刚签发的令牌应通过校验");
+
+        assert_ne!(first_claims.jti, second_claims.jti, "同一毫秒内的两次签发不能共用一个标识");
+        assert_ne!(first, second, "令牌本身也必须不同，否则会话表会撞唯一键");
+    }
+
     #[test]
     fn rejects_token_signed_with_another_secret() {
         let config = test_jwt_config();
-        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("access token 应签发成功");
+        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("登录令牌应签发成功");
 
         let mut other_config = test_jwt_config();
         other_config.secret = "another-unit-test-secret-32-characters".to_owned();
@@ -474,7 +477,7 @@ mod tests {
     #[test]
     fn rejects_token_with_another_issuer() {
         let config = test_jwt_config();
-        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("access token 应签发成功");
+        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("登录令牌应签发成功");
 
         let mut other_config = test_jwt_config();
         other_config.issuer = "another-issuer".to_owned();
@@ -482,24 +485,28 @@ mod tests {
         assert!(AuthService::verify_access_token(&other_config, &token).is_err(), "签发者不匹配的令牌必须被拒绝");
     }
 
+    /// 过期令牌的文案必须明确指向「重新登录」：本项目没有刷新接口，
+    /// 客户端拿到这句话唯一的正确动作就是跳登录页。
     #[test]
     fn rejects_expired_token() {
         let mut config = test_jwt_config();
-        config.access_ttl_minutes = -10;
+        config.ttl_minutes = -10;
 
-        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("access token 应签发成功");
+        let token = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("登录令牌应签发成功");
 
         // 恢复正数有效期，确保失败原因只可能是令牌过期。
-        config.access_ttl_minutes = 15;
+        config.ttl_minutes = 10_080;
 
         match AuthService::verify_access_token(&config, &token) {
-            Err(AppError::Unauthorized(message)) => assert_eq!(message, "认证令牌已过期"),
+            Err(AppError::Unauthorized(message)) => assert_eq!(message, "认证令牌已过期，请重新登录"),
             other => panic!("过期令牌应返回 401，实际为 {other:?}"),
         }
     }
 
     /// 该用例锁定一条关键安全约束：伪造的 `typ` 不能通过校验。
-    /// 缺少这项检查时，长效刷新令牌就能被当作 access token 使用。
+    ///
+    /// 目前只有一种登录令牌，但「用途」必须写进契约：将来引入其他用途的令牌
+    ///（例如一次性链接）时，忘记断言类型的后果就是越权使用。
     #[test]
     fn rejects_token_with_wrong_type() {
         let config = test_jwt_config();
@@ -510,7 +517,7 @@ mod tests {
             exp: (now + ChronoDuration::minutes(15)).timestamp(),
             iat: now.timestamp(),
             jti: "test".to_owned(),
-            typ: "refresh".to_owned(),
+            typ: "other-purpose".to_owned(),
         };
         let token = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(config.secret.as_bytes())).expect("测试令牌应签发成功");
 
@@ -544,8 +551,7 @@ mod tests {
             max_login_failures: 5,
             login_window_minutes: 15,
             cookie: crate::config::CookieConfig {
-                access_name: "access_token".to_owned(),
-                refresh_name: "refresh_token".to_owned(),
+                name: "access_token".to_owned(),
                 secure: false,
                 same_site: "strict".to_owned(),
                 path: "/".to_owned(),
@@ -574,9 +580,9 @@ mod tests {
     async fn skips_revocation_for_expired_token() {
         let store = crate::infrastructure::redis::RedisStore::without_connection();
         let mut config = test_jwt_config();
-        config.access_ttl_minutes = -10;
-        let expired = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("access token 应签发成功");
-        config.access_ttl_minutes = 15;
+        config.ttl_minutes = -10;
+        let expired = encode_access_token(&config, 1, Uuid::now_v7(), Utc::now()).expect("登录令牌应签发成功");
+        config.ttl_minutes = 10_080;
 
         let result = AuthService::revoke_access_token(&store, &config, &expired).await;
 
@@ -584,17 +590,8 @@ mod tests {
     }
 
     #[test]
-    fn generates_unique_refresh_tokens() {
-        let first = generate_refresh_token();
-        let second = generate_refresh_token();
-        assert_ne!(first, second, "刷新令牌必须每次不同");
-        // 32 字节十六进制编码后长度为 64。
-        assert_eq!(first.len(), 64);
-    }
-
-    #[test]
     fn hashes_token_deterministically() {
-        let token = "sample-refresh-token";
+        let token = "sample-token";
 
         assert_eq!(hash_token(token), hash_token(token));
         assert_ne!(hash_token(token), hash_token("another-token"));

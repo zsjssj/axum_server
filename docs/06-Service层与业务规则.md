@@ -8,7 +8,7 @@
 
 | 理由 | 具体表现 |
 | --- | --- |
-| 复用 | 创建用户的规则既要给 `POST /api/v1/users` 用，也要给启动期引导账号用（`src/app/bootstrap.rs:56`） |
+| 复用 | 创建用户的规则既要给 `POST /api/v1/users` 用，也要给启动期引导账号用（`src/app/bootstrap.rs:51`） |
 | 隔离 HTTP | Service 返回 `Result<User, AppError>`，不认识 `StatusCode`、`Json`、`IntoResponse` |
 | 可测 | 密码哈希、错误归类、缓存失效这些逻辑可以单独写单元测试，不需要起 HTTP |
 
@@ -60,11 +60,11 @@ pub async fn create_user(db: &PgPool, req: CreateUserRequest) -> Result<User, Ap
 ## 6.3 读路径与缓存：Cache-Aside
 
 ```rust
-// src/modules/user/service.rs:66
+// src/modules/user/service.rs:51
 pub async fn get_user_by_public_id(db: &PgPool, redis: &RedisStore, public_id: Uuid)
     -> Result<User, AppError>
 {
-    let key = redis.user_detail_key(public_id);
+    let key = redis.key_user_detail(public_id);
 
     match redis.get_json::<User>(&key).await {
         Ok(Some(user)) => {
@@ -105,7 +105,7 @@ pub async fn get_user_by_public_id(db: &PgPool, redis: &RedisStore, public_id: U
 ## 6.4 写路径：先写库，再删缓存
 
 ```rust
-// src/modules/user/service.rs:98
+// src/modules/user/service.rs:76
 pub async fn update_user(db: &PgPool, redis: &RedisStore, public_id: Uuid, req: UpdateUserRequest)
     -> Result<User, AppError>
 {
@@ -141,11 +141,11 @@ pub async fn update_user(db: &PgPool, redis: &RedisStore, public_id: Uuid, req: 
 还有第二个决定：
 
 ```rust
-// src/modules/user/service.rs:138
+// src/modules/user/service.rs:102
 /// 采用「删除」而不是「写入新值」：并发更新时写入会让两次写的先后顺序
 /// 决定缓存内容，而删除之后由下一次读请求回填，结果必然与数据库一致。
 async fn evict_user_cache(redis: &RedisStore, public_id: Uuid) {
-    let key = redis.user_detail_key(public_id);
+    let key = redis.key_user_detail(public_id);
 
     if let Err(error) = redis.delete(&key).await {
         tracing::warn!(%error, "删除用户缓存失败，陈旧数据将在 TTL 到期后自动失效");
@@ -164,10 +164,10 @@ async fn evict_user_cache(redis: &RedisStore, public_id: Uuid) {
 | 顺序约束 | 位置 | 顺序颠倒的后果 |
 | --- | --- | --- |
 | **先限流判定，再校验密码** | `src/modules/auth/service.rs:90` | Argon2 很慢，大量失败请求会占满阻塞线程池，限流本身变成算力攻击面 |
-| **先写数据库，再删缓存** | `src/modules/user/service.rs:108` | 并发下旧值被重新回填，脏数据活到 TTL 到期 |
+| **先写数据库，再删缓存** | `src/modules/user/service.rs:81` | 并发下旧值被重新回填，脏数据活到 TTL 到期 |
 | **先清数据库审计，不清 Redis 计数** | `src/modules/auth/service.rs:119` | 清空窗口内计数 = 给攻击者"偶尔成功一次就重置限额"的入口 |
-| **先落新会话，再把旧会话标记轮换** | `src/modules/auth/service.rs:225` | 旧会话失效但新会话没写成功 → 用户被踢下线且无法续期 |
-| **吊销 refresh 会话在前，写 jti 吊销在后** | `src/modules/auth/handler.rs:238` | 顺序反了影响不大，但两者都必须尽力执行（不能因前者失败跳过后者） |
+| **先签发令牌，再写审计摘要** | `src/modules/auth/service.rs:259` | 先落库再签发，签发失败会留下指向不存在令牌的记录；先签发却落库失败，则审计与凭据脱节 |
+| **登出时先标记会话审计，再写 jti 吊销** | `src/modules/auth/handler.rs:160` | 顺序反了影响不大，但两者都必须尽力执行（不能因前者失败跳过后者） |
 
 这类约束有一个共同特征：**单看某一行的代码都是对的**，只有放在流程里才能判断顺序对不对。所以它们必须写进注释（本项目都写了），否则下一个改代码的人会"顺手"调换。
 
@@ -207,7 +207,7 @@ async fn evict_user_cache(redis: &RedisStore, public_id: Uuid) {
 1. **加一个业务规则**：让 `update_user` 在"邮箱没变、昵称也没变"时直接返回当前数据、不执行 UPDATE、不发删除缓存。想清楚：这个规则该放 Service 还是 Repository？为什么？
 2. **观察删除缓存的必要性**：临时注释掉 `update_user` 里的 `evict_user_cache`，更新一个用户后立刻查询详情，你会看到旧值（TTL 60 秒）。等 60 秒再查，值变新了——这就是 TTL 兜底。**改完还原。**
 3. **制造一次 N+1**：在 `get_users` 里对每个用户额外查一次详情（循环 + `await`），用 `tracing` 数一下 SQL 次数，然后改成一条 `IN` 查询。
-4. **给引导账号路径加日志**：读 `src/app/bootstrap.rs`，确认它复用了 `UserService::create_user`（`:56`）。想想如果不复用、直接写 SQL 会有什么风险。
+4. **给引导账号路径加日志**：读 `src/app/bootstrap.rs`，确认它复用了 `UserService::create_user`（`:51`）。想想如果不复用、直接写 SQL 会有什么风险。
 
 ## 6.9 自测题
 

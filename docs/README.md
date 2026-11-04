@@ -56,7 +56,7 @@
 | [06 Service 层](./06-Service层与业务规则.md) | 业务规则、阻塞任务、错误归类、顺序即正确性 | `src/modules/user/service.rs` |
 | [07 统一响应与错误处理](./07-统一响应与错误处理.md) | 响应信封、业务码、`AppError` 与 `IntoResponse` | `src/common/response.rs`、`src/common/error.rs` |
 | [08 全局状态与中间件](./08-全局状态与中间件.md) | `AppState`、`tower` 中间件、中间件顺序 | `src/app/state.rs`、`src/common/auth.rs`、`src/app/middleware.rs` |
-| [09 认证与授权](./09-认证与授权.md) | JWT、Cookie、双令牌轮换、重放检测、限流 | `src/modules/auth/*`、`src/common/cookie.rs` |
+| [09 认证与授权](./09-认证与授权.md) | JWT、Cookie、单令牌与到期重新登录、登出吊销、限流 | `src/modules/auth/*`、`src/common/cookie.rs` |
 | [10 Redis 与降级设计](./10-Redis与降级设计.md) | 缓存、滑动窗口、吊销列表、降级矩阵 | `src/infrastructure/redis.rs` |
 | [11 可观测性](./11-可观测性与健康检查.md) | 结构化日志、`/health` 与 `/ready` | `src/main.rs`、`src/app/middleware.rs`、`src/app/routes.rs` |
 | [12 API 文档与测试](./12-API文档与测试.md) | utoipa、Swagger、单元/集成测试策略 | `src/app/openapi.rs`、各文件 `mod tests` |
@@ -181,7 +181,7 @@ cargo test             # 单元测试 + 集成测试（不需要真实数据库�
 | `src/infrastructure/database.rs` | 连接池与迁移 | 04 |
 | `src/infrastructure/redis.rs` | Redis 适配层（键、脚本、缓存原语） | 10 |
 | `src/modules/user/*` | 用户模块：model/repository/service/handler | 04、05、06 |
-| `src/modules/auth/*` | 认证模块：登录、刷新、登出、当前用户 | 09 |
+| `src/modules/auth/*` | 认证模块：登录、登出、当前用户 | 09 |
 | `src/modules/information/*` | 聊天消息模块：会话、成员、消息、已读回执、撤回 | 04、06、07、13 |
 | `migrations/*.sql` | 数据库结构演进 | 04 |
 | `config/*.toml` | 分层配置 | 03 |

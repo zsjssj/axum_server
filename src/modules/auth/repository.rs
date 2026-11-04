@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use uuid::Uuid;
 
 /// 登出时定位会话所需的最小记录。
 ///
@@ -11,30 +10,18 @@ pub struct SessionRecord {
     pub id: i64,
 }
 
-/// 会话及其所属用户的公开标识。
-///
-/// 轮换令牌时需要同时取得用户公开标识用于签发新的 access token，
-/// 放在同一个查询里避免多发一次往返。
-///
-/// `is_revoked` 刻意让 SQL 返回布尔值而不是映射 `Option<DateTime<Utc>>`：
-/// 驱动对 `Option` 的行为在 PostgreSQL 与 SQLite 之间并不一致，
-/// 直接返回布尔值可以避开这个差异。
-#[derive(Debug, sqlx::FromRow)]
-pub struct SessionWithUser {
-    pub id: i64,
-    pub user_id: i64,
-    pub public_id: Uuid,
-    pub is_revoked: bool,
-    pub expires_at: DateTime<Utc>,
-}
-
 /// 认证数据访问层。
 ///
-/// 覆盖刷新令牌会话与登录失败计数两类持久化需求。
+/// 覆盖登录会话审计与登录失败计数两类持久化需求。会话表在单令牌方案下
+/// **不参与认证**：每次请求的令牌校验只看签名与 Redis 吊销列表，
+/// 这里写入的记录用于回答「谁在什么时候、从哪个客户端登录过」。
 pub struct AuthRepository;
 
 impl AuthRepository {
-    /// 创建刷新令牌会话，返回新会话主键。
+    /// 创建一条登录会话审计记录，返回新记录主键。
+    ///
+    /// `token_hash` 是登录令牌的摘要，不是令牌本身：数据库泄露时攻击者
+    /// 无法用摘要反推出可用的令牌。
     pub async fn create_session(
         db: &PgPool,
         user_id: i64,
@@ -82,27 +69,6 @@ impl AuthRepository {
         Ok(session)
     }
 
-    /// 按令牌摘要查询会话及其用户公开标识。
-    pub async fn find_session_with_user(
-        db: &PgPool,
-        token_hash: &str,
-    ) -> Result<Option<SessionWithUser>, sqlx::Error> {
-        let session = sqlx::query_as::<_, SessionWithUser>(
-            r#"
-            SELECT s.id, s.user_id, u.public_id,
-                   (s.revoked_at IS NOT NULL) AS is_revoked, s.expires_at
-            FROM user_sessions s
-            JOIN users u ON u.id = s.user_id
-            WHERE s.token_hash = $1
-            "#,
-        )
-        .bind(token_hash)
-        .fetch_optional(db)
-        .await?;
-
-        Ok(session)
-    }
-
     /// 吊销单个会话。
     ///
     /// 使用 `revoked_at IS NULL` 作为条件，使重复吊销成为幂等操作，
@@ -120,51 +86,6 @@ impl AuthRepository {
         .await?;
 
         Ok(result.rows_affected() > 0)
-    }
-
-    /// 记录令牌轮换关系：旧会话标记吊销并指向新会话。
-    ///
-    /// 两条更新放在同一事务中，避免出现旧会话已吊销而轮换关系缺失的中间状态。
-    pub async fn rotate_session(db: &PgPool, old_id: i64, new_id: i64) -> Result<(), sqlx::Error> {
-        let mut transaction = db.begin().await?;
-
-        sqlx::query(
-            r#"
-            UPDATE user_sessions
-            SET revoked_at = NOW(), replaced_by = $2
-            WHERE id = $1 AND revoked_at IS NULL
-            "#,
-        )
-        .bind(old_id)
-        .bind(new_id)
-        .execute(&mut *transaction)
-        .await?;
-
-        transaction.commit().await?;
-
-        Ok(())
-    }
-
-    /// 吊销指定用户的全部有效会话。
-    ///
-    /// 用于检测到刷新令牌重放时强制该用户重新登录：此时无法判断攻击者与
-    /// 合法用户，只能同时失效双方的全部凭据。
-    pub async fn revoke_all_sessions_for_user(
-        db: &PgPool,
-        user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE user_sessions
-            SET revoked_at = NOW()
-            WHERE user_id = $1 AND revoked_at IS NULL
-            "#,
-        )
-        .bind(user_id)
-        .execute(db)
-        .await?;
-
-        Ok(result.rows_affected())
     }
 
     /// 统计指定时间点之后的登录失败次数。

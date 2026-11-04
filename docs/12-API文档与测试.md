@@ -104,7 +104,7 @@ pub struct Pagination {
     )),
     tags(
         (name = "系统", description = "服务状态与示例接口"),
-        (name = "认证", description = "登录、令牌刷新与登出"),
+        (name = "认证", description = "登录、登出与当前用户"),
         (name = "用户", description = "用户管理接口")
     )
 )]
@@ -167,7 +167,7 @@ src/app/mod.rs 里的集成式测试                ← 走完整 Router，但�
 | 文件 | 数量 | 测什么 |
 | --- | ---: | --- |
 | `modules/information/model.rs` | 18 | 会话/消息校验、撤回必须清空正文、游标参数边界 |
-| `modules/auth/service.rs` | 16 | JWT 签发/校验/过期/类型、重放、哈希 |
+| `modules/auth/service.rs` | 17 | JWT 签发/校验/过期/类型、有效期取自配置、摘要哈希 |
 | `config/mod.rs` | 14 | 各类非法配置必须被拒 |
 | `app/mod.rs` | 17 | 路由、认证中间件、信封、404/405 |
 | `common/cookie.rs` | 12 | Cookie 解析与安全属性 |
@@ -246,13 +246,13 @@ async fn dispatch(method: Method, uri: &str, body: Body, content_type: bool, acc
 认证中间件挂在 `/api/v1` 整组上，所以**任何业务接口的测试都必须带合法令牌**，否则测到的是 401 而不是目标行为。项目提供了一个专门的方法：
 
 ```rust
-// src/modules/auth/service.rs:319
+// src/modules/auth/service.rs:227
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn issue_test_access_token(jwt_config: &JwtConfig, user_id: i64, expires_at: i64) -> String
 ```
 
-它为什么值得单独讲？注释里解释了三层考虑（`:305-318`）：
+它为什么值得单独讲？注释里解释了三层考虑（`:211-226`）：
 
 1. **复用生产的 `AccessClaims` 结构**。如果测试自己拼 JSON 造 JWT，生产改了字段测试还会通过——覆盖价值归零。
 2. **`#[doc(hidden)]` 而不是 `#[cfg(test)]`**。`cfg(test)` 只在编译本 crate 的测试目标时生效，而 `tests/` 下的集成测试是**独立 crate**，看不到这个函数。
@@ -313,11 +313,12 @@ async fn lets_authenticated_request_reach_business_layer() {
 同类技巧还有：
 
 ```rust
-// src/app/mod.rs:314
-async fn keeps_refresh_reachable_without_token() {
-    // 带合法 access token 但没有 refresh_token：
-    // 看到"缺少刷新令牌"而不是"未登录或登录已过期"，就证明请求穿过了中间件
-    assert_eq!(body["message"], "缺少刷新令牌");
+// src/app/mod.rs:301
+async fn returns_not_found_for_removed_refresh_route() {
+    // 刷新接口已下线：带不带令牌都应当落到统一 404，
+    // 而不是被认证中间件拦成 401 —— 后者会让人误以为"接口还在，只是没登录"
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_body(response).await["code"], 40400);
 }
 ```
 
@@ -331,7 +332,7 @@ async fn keeps_refresh_reachable_without_token() {
 | 白名单与路由 | `keeps_logout_reachable_without_token` | 改坏后登出变成 401，客户端卡死 |
 | 序列化往返 | `user_round_trips_through_cache_json` | 改坏后只在缓存命中时 500 |
 | 配置校验 | `rejects_short_jwt_secret`、`falls_back_to_strict_same_site` | 改坏后服务能启动，但防护变弱 |
-| 契约细节 | `cookies_use_matching_max_age` | 改坏后浏览器行为异常，服务端无感 |
+| 契约细节 | `cookie_uses_token_expiry_as_max_age` | 改坏后浏览器在令牌失效后继续发送 Cookie，服务端反复处理注定失败的请求 |
 
 | 可以不写 | 为什么 |
 | --- | --- |

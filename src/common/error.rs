@@ -115,7 +115,6 @@ impl IntoResponse for AppError {
                 (StatusCode::INTERNAL_SERVER_ERROR, ApiCode::InternalError, "服务器内部错误", Vec::new())
             }
         };
-
         (
             status,
             Json(ApiResponse::error(code, message, (!details.is_empty()).then_some(ErrorData { details }))),

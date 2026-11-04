@@ -50,7 +50,7 @@ mod tests {
     use crate::config::{AuthConfig, JwtConfig};
     use crate::modules::auth::service::AuthService;
 
-    /// 与测试配置 `auth.cookie.access_name` 保持一致的 Cookie 名称。
+    /// 与测试配置 `auth.cookie.name` 保持一致的 Cookie 名称。
     const ACCESS_COOKIE_NAME: &str = "access_token";
 
     /// 测试令牌的 `exp` 取值。取一个远大于当前时间的绝对值，
@@ -78,6 +78,7 @@ mod tests {
             database: crate::config::DatabaseConfig {
                 url: "postgres://user:password@localhost/test".to_owned(),
                 max_connections: 1,
+                connection_timeout_seconds: 10,
             },
             log: crate::config::LogConfig { level: "info".to_owned() },
             redis: crate::config::RedisConfig {
@@ -85,19 +86,18 @@ mod tests {
                 pool_size: 2,
                 key_prefix: "axum-test".to_owned(),
                 user_cache_ttl_seconds: 60,
+                connection_timeout_seconds: 5,
             },
             jwt: JwtConfig {
                 secret: "integration-test-secret-32-characters".to_owned(),
                 issuer: "rust-axum-server-test".to_owned(),
-                access_ttl_minutes: 15,
-                refresh_ttl_days: 7,
+                ttl_minutes: 10_080,
             },
             auth: AuthConfig {
                 max_login_failures: 5,
                 login_window_minutes: 15,
                 cookie: crate::config::CookieConfig {
-                    access_name: "access_token".to_owned(),
-                    refresh_name: "refresh_token".to_owned(),
+                    name: "access_token".to_owned(),
                     secure: false,
                     same_site: "strict".to_owned(),
                     path: "/".to_owned(),
@@ -283,7 +283,7 @@ mod tests {
     }
 
     /// 登出必须匿名可达。判断依据是**响应结果而不是状态码**：认证中间件拦截时
-    /// 返回 `401 未登录或登录已过期`，而登出是幂等操作，即使没有刷新令牌也应
+    /// 返回 `401 未登录或登录已过期`，而登出是幂等操作，即使没有令牌也应
     /// 返回成功。只有请求真正进入 Handler 才会得到 `code = 0`。
     #[tokio::test]
     async fn keeps_logout_reachable_without_token() {
@@ -293,19 +293,20 @@ mod tests {
         assert_eq!(body["code"], 0, "登出不应被认证中间件拦截");
     }
 
-    /// 刷新必须匿名可达，否则 access token 过期后客户端无法续期。
+    /// 刷新接口已下线，必须返回 `404` 而不是留下一个能换取新令牌的后门。
     ///
-    /// 携带合法的 access token Cookie、但没有 `refresh_token`：认证中间件
-    /// 只看 access token，因此请求会被放行；Handler 随后因缺少刷新令牌返回
-    /// 自己的文案。看到「缺少刷新令牌」而非中间件的「未登录或登录已过期」，
-    /// 就证明请求确实穿过了中间件。同时该断言不需要访问数据库。
+    /// 同时确认它不再被认证中间件特别对待：无论是否携带令牌，该路径都只是
+    /// 一条不存在的路由，直接落到统一 fallback。
     #[tokio::test]
-    async fn keeps_refresh_reachable_without_token() {
-        let access_token = AuthService::issue_test_access_token(&test_config().jwt, 1, LONG_LIVED_TOKEN_EXPIRY);
-        let response = dispatch(Method::POST, "/api/v1/auth/refresh", Body::empty(), true, Some(&access_token)).await;
-        let body = json_body(response).await;
+    async fn returns_not_found_for_removed_refresh_route() {
+        let token = AuthService::issue_test_access_token(&test_config().jwt, 1, LONG_LIVED_TOKEN_EXPIRY);
 
-        assert_eq!(body["message"], "缺少刷新令牌", "刷新接口应进入 Handler 而不是被中间件拦截");
+        for access_token in [None, Some(token.as_str())] {
+            let response = dispatch(Method::POST, "/api/v1/auth/refresh", Body::empty(), true, access_token).await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(json_body(response).await["code"], 40400);
+        }
     }
 
     /// 登录必须匿名可达。这里用无法通过校验的请求体：只要响应不是中间件的

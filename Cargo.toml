@@ -20,7 +20,6 @@ dotenvy = "0.15.7"
 # 不显式启用 rust_crypto（纯 Rust 实现）或 aws_lc_rs（需要本地 C 工具链）时，
 # 首次签发/校验令牌会 panic "Could not automatically determine the process-level CryptoProvider"。
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-rand = "0.10"
 # script 特性用于 EVAL：登录失败计数需要「修剪 + 写入 + 统计」原子完成。
 # tokio-rustls-comp 让 `rediss://` 真正可用（TLS 连接），配置校验也接受该协议。
 redis = { version = "1.7.1", default-features = false, features = [
